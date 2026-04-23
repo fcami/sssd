@@ -4273,6 +4273,98 @@ START_TEST (test_sysdb_memberof_many_groups_same_users)
 }
 END_TEST
 
+#define SYSDB_PATH_USER_BASE 90000
+#define SYSDB_PATH_GID 95000
+#define SYSDB_PATH_NUM_MEMBERS 200
+
+START_TEST (test_sysdb_store_group_members_basic)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int ret;
+    int i;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    for (i = 0; i < SYSDB_PATH_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  SYSDB_PATH_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+
+    /* Create empty group first */
+    data = test_data_new_group(test_ctx, SYSDB_PATH_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store group");
+
+    /* Build attrs with member DNs */
+    attrs = sysdb_new_attrs(test_ctx);
+    sss_ck_fail_if_msg(attrs == NULL, "OOM");
+
+    for (i = 0; i < SYSDB_PATH_NUM_MEMBERS; i++) {
+        username = test_asprintf_fqname(test_ctx, test_ctx->domain,
+                                        "testuser%d",
+                                        SYSDB_PATH_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(test_ctx,
+                                  test_ctx->domain->name,
+                                  username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Failed to add member %d", i);
+    }
+
+    /* Store members via the new sysdb path */
+    perf_snap_take(&snap_before);
+    ret = sysdb_store_group_members(test_ctx->domain,
+                                    data->groupname, attrs,
+                                    SYSDB_PATH_GID);
+    perf_snap_take(&snap_after);
+    sss_ck_fail_if_msg(ret != EOK,
+                       "sysdb_store_group_members failed");
+    perf_snap_report("sysdb_path: store members",
+                     &snap_before, &snap_after);
+
+    /* Verify memberOf on user 0 */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   SYSDB_PATH_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on user 0");
+
+    /* Verify memberuid on the group */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    SYSDB_PATH_GID,
+                                    all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "memberuid not set on group");
+    ck_assert_msg(el->num_values == SYSDB_PATH_NUM_MEMBERS,
+                  "Expected %d memberuid, got %d",
+                  SYSDB_PATH_NUM_MEMBERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST (test_sysdb_set_get_bool)
 {
     struct sysdb_test_ctx *test_ctx;
@@ -8109,6 +8201,231 @@ void hosts_check_match(struct sysdb_test_ctx *test_ctx,
         hosts_check_match(test_ctx, false, search_name, primary_name, aliases, addresses); \
     } while(0);
 
+/* === sysdb-path removal test === */
+
+#define REMOVAL_USER_BASE 160000
+#define REMOVAL_GID 165000
+#define REMOVAL_NUM_INITIAL 10
+#define REMOVAL_NUM_AFTER 8
+
+START_TEST (test_sysdb_store_group_members_removal)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    int ret;
+    int i;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create 10 users */
+    for (i = 0; i < REMOVAL_NUM_INITIAL; i++) {
+        data = test_data_new_user(test_ctx, REMOVAL_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK, "Could not store user %d", i);
+    }
+
+    /* Store group with all 10 members via sysdb path */
+    data = test_data_new_group(test_ctx, REMOVAL_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store group");
+
+    attrs = sysdb_new_attrs(test_ctx);
+    sss_ck_fail_if_msg(attrs == NULL, "OOM");
+    for (i = 0; i < REMOVAL_NUM_INITIAL; i++) {
+        username = test_asprintf_fqname(attrs, test_ctx->domain,
+                                        "testuser%d", REMOVAL_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(attrs, test_ctx->domain->name, username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add member %d", i);
+    }
+    ret = sysdb_store_group_members(test_ctx->domain,
+                                    data->groupname, attrs, REMOVAL_GID);
+    sss_ck_fail_if_msg(ret != EOK, "Initial store failed");
+
+    /* Store again with only 8 members (drop users 8 and 9) */
+    attrs = sysdb_new_attrs(test_ctx);
+    sss_ck_fail_if_msg(attrs == NULL, "OOM");
+    for (i = 0; i < REMOVAL_NUM_AFTER; i++) {
+        username = test_asprintf_fqname(attrs, test_ctx->domain,
+                                        "testuser%d", REMOVAL_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(attrs, test_ctx->domain->name, username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add member %d", i);
+    }
+    ret = sysdb_store_group_members(test_ctx->domain,
+                                    data->groupname, attrs, REMOVAL_GID);
+    sss_ck_fail_if_msg(ret != EOK, "Removal store failed");
+
+    /* Verify: removed users 8,9 lost memberOf */
+    for (i = REMOVAL_NUM_AFTER; i < REMOVAL_NUM_INITIAL; i++) {
+        ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                       REMOVAL_USER_BASE + i,
+                                       all_attrs, &msg);
+        sss_ck_fail_if_msg(ret != EOK, "Could not find user %d", i);
+        el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+        ck_assert_msg(el == NULL,
+                      "User %d still has memberOf after removal", i);
+    }
+
+    /* Verify: retained users 0-7 still have memberOf */
+    for (i = 0; i < REMOVAL_NUM_AFTER; i++) {
+        ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                       REMOVAL_USER_BASE + i,
+                                       all_attrs, &msg);
+        sss_ck_fail_if_msg(ret != EOK, "Could not find user %d", i);
+        el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+        ck_assert_msg(el != NULL,
+                      "User %d lost memberOf after removal", i);
+    }
+
+    /* Verify: group memberuid has exactly 8 entries */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    REMOVAL_GID, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find group");
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "No memberuid after removal");
+    ck_assert_msg(el->num_values == REMOVAL_NUM_AFTER,
+                  "Expected %d memberuid, got %d",
+                  REMOVAL_NUM_AFTER, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+#define SYSDB_PATH_LARGE_USER_BASE 100000
+#define SYSDB_PATH_LARGE_GID 110000
+#define SYSDB_PATH_LARGE_NUM_MEMBERS 10000
+#define SYSDB_PATH_LARGE_NUM_GROUPS 12
+
+START_TEST (test_sysdb_store_group_members_large)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    char *groupname;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int ret;
+    int i;
+    int g;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    perf_snap_take(&snap_before);
+    for (i = 0; i < SYSDB_PATH_LARGE_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  SYSDB_PATH_LARGE_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("sysdb_path_large: create users",
+                     &snap_before, &snap_after);
+
+    /* Store groups via the sysdb bypass path */
+    for (g = 0; g < SYSDB_PATH_LARGE_NUM_GROUPS; g++) {
+        data = test_data_new_group(test_ctx,
+                                   SYSDB_PATH_LARGE_GID + g);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_group(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store group %d", g);
+
+        attrs = sysdb_new_attrs(test_ctx);
+        sss_ck_fail_if_msg(attrs == NULL, "OOM");
+
+        for (i = 0; i < SYSDB_PATH_LARGE_NUM_MEMBERS; i++) {
+            username = test_asprintf_fqname(attrs,
+                                            test_ctx->domain,
+                                            "testuser%d",
+                                            SYSDB_PATH_LARGE_USER_BASE + i);
+            sss_ck_fail_if_msg(username == NULL, "OOM");
+            member = sysdb_user_strdn(attrs,
+                                      test_ctx->domain->name,
+                                      username);
+            sss_ck_fail_if_msg(member == NULL, "OOM");
+            ret = sysdb_attrs_steal_string(attrs,
+                                           SYSDB_MEMBER, member);
+            sss_ck_fail_if_msg(ret != EOK,
+                               "Failed to add member %d", i);
+        }
+
+        groupname = test_asprintf_fqname(test_ctx,
+                                         test_ctx->domain,
+                                         "testgroup%d",
+                                         SYSDB_PATH_LARGE_GID + g);
+        sss_ck_fail_if_msg(groupname == NULL, "OOM");
+
+        perf_snap_take(&snap_before);
+        ret = sysdb_store_group_members(test_ctx->domain,
+                                        groupname, attrs,
+                                        SYSDB_PATH_LARGE_GID + g);
+        perf_snap_take(&snap_after);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "sysdb_store_group_members failed for group %d",
+                           g);
+        if (g % 4 == 3 || g == 0) {
+            char label[64];
+            snprintf(label, sizeof(label),
+                     "sysdb_path_large: group %d/%d",
+                     g + 1, SYSDB_PATH_LARGE_NUM_GROUPS);
+            perf_snap_report(label, &snap_before, &snap_after);
+        }
+
+        talloc_free(attrs);
+    }
+
+    /* Verify user 0 has all groups in memberOf */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   SYSDB_PATH_LARGE_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on user 0");
+    ck_assert_msg(el->num_values == SYSDB_PATH_LARGE_NUM_GROUPS,
+                  "Expected %d memberOf on user 0, got %d",
+                  SYSDB_PATH_LARGE_NUM_GROUPS, el->num_values);
+
+    /* Verify last group has correct memberuid count */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    SYSDB_PATH_LARGE_GID
+                                        + SYSDB_PATH_LARGE_NUM_GROUPS - 1,
+                                    all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find last group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "memberuid not set on last group");
+    ck_assert_msg(el->num_values == SYSDB_PATH_LARGE_NUM_MEMBERS,
+                  "Expected %d memberuid, got %d",
+                  SYSDB_PATH_LARGE_NUM_MEMBERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST(test_sysdb_add_hosts)
 {
     errno_t ret;
@@ -8749,6 +9066,14 @@ Suite *create_sysdb_suite(void)
     tcase_set_timeout(tc_memberof_many, 3600);
     tcase_add_test(tc_memberof_many, test_sysdb_memberof_many_groups_same_users);
     suite_add_tcase(s, tc_memberof_many);
+
+    TCase *tc_sysdb_path = tcase_create(
+        "SYSDB member/memberof sysdb-path Tests");
+    tcase_set_timeout(tc_sysdb_path, 3600);
+    tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_basic);
+    tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_removal);
+    tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_large);
+    suite_add_tcase(s, tc_sysdb_path);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
 
