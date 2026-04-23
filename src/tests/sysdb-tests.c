@@ -27,6 +27,7 @@
 #include <popt.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <arpa/inet.h>
 #include "util/util.h"
 #include "util/crypto/sss_crypto.h"
@@ -60,6 +61,52 @@
 #define LARGE_GROUP_USER_BASE 30000
 #define LARGE_GROUP_GID 50000
 #define LARGE_GROUP_NUM_GROUPS 12
+
+#define MANY_GROUPS_NUM_MEMBERS 2000
+#define MANY_GROUPS_USER_BASE 70000
+#define MANY_GROUPS_GID_BASE 80000
+#define MANY_GROUPS_NUM_GROUPS 50
+
+struct perf_snap {
+    struct timespec wall;
+    struct timespec cpu;
+    int have_cpu;
+    struct rusage ru;
+    int have_ru;
+};
+
+static void perf_snap_take(struct perf_snap *s)
+{
+    clock_gettime(CLOCK_MONOTONIC, &s->wall);
+    s->have_cpu = (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &s->cpu) == 0);
+    s->have_ru = (getrusage(RUSAGE_SELF, &s->ru) == 0);
+}
+
+static void perf_snap_report(const char *label,
+                             const struct perf_snap *before,
+                             const struct perf_snap *after)
+{
+    double wall = (after->wall.tv_sec - before->wall.tv_sec)
+                + (after->wall.tv_nsec - before->wall.tv_nsec) / 1e9;
+
+    fprintf(stderr, "  %s: wall=%.2fs", label, wall);
+
+    if (before->have_cpu && after->have_cpu) {
+        double cpu = (after->cpu.tv_sec - before->cpu.tv_sec)
+                   + (after->cpu.tv_nsec - before->cpu.tv_nsec) / 1e9;
+        fprintf(stderr, " cpu=%.2fs (%.0f%% CPU)",
+                cpu, wall > 0 ? (cpu / wall) * 100.0 : 0);
+    }
+
+    if (before->have_ru && after->have_ru) {
+        long blk_in = after->ru.ru_inblock - before->ru.ru_inblock;
+        long blk_out = after->ru.ru_oublock - before->ru.ru_oublock;
+        fprintf(stderr, " blk_in=%ld blk_out=%ld rss=%ldKB",
+                blk_in, blk_out, after->ru.ru_maxrss);
+    }
+
+    fprintf(stderr, "\n");
+}
 
 #define TEST_AUTOFS_MAP_BASE 29500
 
@@ -3785,9 +3832,8 @@ START_TEST (test_sysdb_memberof_store_large_group)
     const char *all_attrs[] = { "*", NULL };
     char *username;
     char *member;
-    struct timespec ts_start;
-    struct timespec ts_end;
-    double elapsed;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
     int ret;
     int i;
 
@@ -3795,7 +3841,7 @@ START_TEST (test_sysdb_memberof_store_large_group)
     sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
 
     /* Create LARGE_GROUP_NUM_MEMBERS users */
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    perf_snap_take(&snap_before);
     for (i = 0; i < LARGE_GROUP_NUM_MEMBERS; i++) {
         data = test_data_new_user(test_ctx,
                                   LARGE_GROUP_USER_BASE + i);
@@ -3804,11 +3850,8 @@ START_TEST (test_sysdb_memberof_store_large_group)
         sss_ck_fail_if_msg(ret != EOK,
                            "Could not store user %d", i);
     }
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    elapsed = (ts_end.tv_sec - ts_start.tv_sec)
-            + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
-    fprintf(stderr, "  large_group: %d users created in %.2f s\n",
-            LARGE_GROUP_NUM_MEMBERS, elapsed);
+    perf_snap_take(&snap_after);
+    perf_snap_report("large_group: create users", &snap_before, &snap_after);
 
     /* Create a group with all users as members */
     data = test_data_new_group(test_ctx, LARGE_GROUP_GID);
@@ -3827,13 +3870,11 @@ START_TEST (test_sysdb_memberof_store_large_group)
         sss_ck_fail_if_msg(ret != EOK, "Failed to add member %d", i);
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    perf_snap_take(&snap_before);
     ret = test_store_group(data);
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    elapsed = (ts_end.tv_sec - ts_start.tv_sec)
-            + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+    perf_snap_take(&snap_after);
     sss_ck_fail_if_msg(ret != EOK, "Could not store large group");
-    fprintf(stderr, "  large_group: group stored in %.2f s\n", elapsed);
+    perf_snap_report("large_group: store group", &snap_before, &snap_after);
 
     /* Verify memberOf is set on every user */
     for (i = 0; i < LARGE_GROUP_NUM_MEMBERS; i++) {
@@ -3876,9 +3917,9 @@ START_TEST (test_sysdb_memberof_store_multi_group)
     const char *all_attrs[] = { "*", NULL };
     char *username;
     char *member;
-    struct timespec ts_start;
-    struct timespec ts_end;
-    double elapsed;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    char label[64];
     int ret;
     int i;
     int g;
@@ -3887,7 +3928,7 @@ START_TEST (test_sysdb_memberof_store_multi_group)
     sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
 
     /* Create LARGE_GROUP_NUM_MEMBERS users */
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    perf_snap_take(&snap_before);
     for (i = 0; i < LARGE_GROUP_NUM_MEMBERS; i++) {
         data = test_data_new_user(test_ctx,
                                   LARGE_GROUP_USER_BASE + i);
@@ -3896,11 +3937,8 @@ START_TEST (test_sysdb_memberof_store_multi_group)
         sss_ck_fail_if_msg(ret != EOK,
                            "Could not store user %d", i);
     }
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    elapsed = (ts_end.tv_sec - ts_start.tv_sec)
-            + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
-    fprintf(stderr, "  multi_group: %d users created in %.2f s\n",
-            LARGE_GROUP_NUM_MEMBERS, elapsed);
+    perf_snap_take(&snap_after);
+    perf_snap_report("multi_group: create users", &snap_before, &snap_after);
 
     /* Create LARGE_GROUP_NUM_GROUPS groups, each with all users */
     for (g = 0; g < LARGE_GROUP_NUM_GROUPS; g++) {
@@ -3925,16 +3963,15 @@ START_TEST (test_sysdb_memberof_store_multi_group)
                                i, g);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &ts_start);
+        perf_snap_take(&snap_before);
         ret = test_store_group(data);
-        clock_gettime(CLOCK_MONOTONIC, &ts_end);
-        elapsed = (ts_end.tv_sec - ts_start.tv_sec)
-                + (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+        perf_snap_take(&snap_after);
         sss_ck_fail_if_msg(ret != EOK,
                            "Could not store group %d", g);
-        fprintf(stderr,
-                "  multi_group: group %d/%d stored in %.2f s\n",
-                g + 1, LARGE_GROUP_NUM_GROUPS, elapsed);
+        snprintf(label, sizeof(label),
+                 "multi_group: group %d/%d",
+                 g + 1, LARGE_GROUP_NUM_GROUPS);
+        perf_snap_report(label, &snap_before, &snap_after);
     }
 
     /* Verify user 0 has LARGE_GROUP_NUM_GROUPS memberOf entries */
@@ -3964,6 +4001,115 @@ START_TEST (test_sysdb_memberof_store_multi_group)
                       "group %d: expected %d memberuid, got %d",
                       g, LARGE_GROUP_NUM_MEMBERS, el->num_values);
     }
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+START_TEST (test_sysdb_memberof_many_groups_same_users)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    struct perf_snap snap_total_before;
+    char label[64];
+    int ret;
+    int i;
+    int g;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    perf_snap_take(&snap_before);
+    for (i = 0; i < MANY_GROUPS_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  MANY_GROUPS_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("many_groups: create users", &snap_before, &snap_after);
+
+    /* Store MANY_GROUPS_NUM_GROUPS groups, all with the same users.
+     * Each successive group forces mbof_add_operation() to compare
+     * against more existing memberOf entries on each user.
+     * Group g: each user has g existing memberOf entries,
+     * so step (b) does g comparisons per user.
+     * Total comparisons: sum(g, g=0..N-1) * num_users.
+     */
+    perf_snap_take(&snap_total_before);
+    for (g = 0; g < MANY_GROUPS_NUM_GROUPS; g++) {
+        data = test_data_new_group(test_ctx,
+                                   MANY_GROUPS_GID_BASE + g);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+
+        for (i = 0; i < MANY_GROUPS_NUM_MEMBERS; i++) {
+            username = test_asprintf_fqname(data,
+                                            test_ctx->domain,
+                                            "testuser%d",
+                                            MANY_GROUPS_USER_BASE + i);
+            sss_ck_fail_if_msg(username == NULL, "OOM");
+            member = sysdb_user_strdn(data,
+                                      test_ctx->domain->name,
+                                      username);
+            sss_ck_fail_if_msg(member == NULL, "OOM");
+            ret = sysdb_attrs_steal_string(data->attrs,
+                                           SYSDB_MEMBER, member);
+            sss_ck_fail_if_msg(ret != EOK,
+                               "Failed to add member %d to group %d",
+                               i, g);
+        }
+
+        perf_snap_take(&snap_before);
+        ret = test_store_group(data);
+        perf_snap_take(&snap_after);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store group %d", g);
+        if (g % 10 == 9 || g == 0) {
+            snprintf(label, sizeof(label),
+                     "many_groups: group %d/%d",
+                     g + 1, MANY_GROUPS_NUM_GROUPS);
+            perf_snap_report(label, &snap_before, &snap_after);
+        }
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("many_groups: all groups total",
+                     &snap_total_before, &snap_after);
+
+    /* Verify user 0 has all groups in memberOf */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   MANY_GROUPS_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on user 0");
+    ck_assert_msg(el->num_values == MANY_GROUPS_NUM_GROUPS,
+                  "Expected %d memberOf on user 0, got %d",
+                  MANY_GROUPS_NUM_GROUPS, el->num_values);
+
+    /* Spot-check last group has correct memberuid count */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    MANY_GROUPS_GID_BASE
+                                        + MANY_GROUPS_NUM_GROUPS - 1,
+                                    all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find last group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL,
+                  "memberuid not set on last group");
+    ck_assert_msg(el->num_values == MANY_GROUPS_NUM_MEMBERS,
+                  "Expected %d memberuid, got %d",
+                  MANY_GROUPS_NUM_MEMBERS, el->num_values);
 
     talloc_free(test_ctx);
 }
@@ -8438,6 +8584,12 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_memberof_large, test_sysdb_memberof_store_large_group);
     tcase_add_test(tc_memberof_large, test_sysdb_memberof_store_multi_group);
     suite_add_tcase(s, tc_memberof_large);
+
+    TCase *tc_memberof_many = tcase_create(
+        "SYSDB member/memberof many groups Tests");
+    tcase_set_timeout(tc_memberof_many, 3600);
+    tcase_add_test(tc_memberof_many, test_sysdb_memberof_many_groups_same_users);
+    suite_add_tcase(s, tc_memberof_many);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
 
