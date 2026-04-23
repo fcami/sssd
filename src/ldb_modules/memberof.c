@@ -76,6 +76,7 @@ struct mbof_add_ctx {
     struct mbof_ctx *ctx;
 
     struct mbof_add_operation *add_list;
+    struct mbof_add_operation *add_list_tail;
     struct mbof_add_operation *current_op;
 
     hash_table_t *dedup_table;
@@ -394,31 +395,22 @@ static int mbof_append_addop(struct mbof_add_ctx *add_ctx,
                              struct mbof_dn_array *parents,
                              struct ldb_dn *entry_dn)
 {
-    struct mbof_add_operation *lastop = NULL;
     struct mbof_add_operation *addop;
-    const char *entry_dn_linearized = ldb_dn_get_linearized(entry_dn);
+    const char *key;
+    hash_key_t hkey;
+    hash_value_t hval;
+    int hret;
 
-    if (entry_dn_linearized == NULL) {
-        return LDB_ERR_INVALID_DN_SYNTAX;
+    key = ldb_dn_get_casefold(entry_dn);
+    if (key == NULL) {
+        return LDB_ERR_OPERATIONS_ERROR;
     }
 
-    /* test if this is a duplicate */
-    /* FIXME: this is not efficient */
-    if (add_ctx->add_list) {
-        do {
-            if (lastop) {
-                lastop = lastop->next;
-            } else {
-                lastop = add_ctx->add_list;
-            }
-
-            /* FIXME: check if this is right, might have to compare parents */
-            if (sss_linearized_dn_match(ldb_dn_get_linearized(lastop->entry_dn),
-                                       entry_dn_linearized)) {
-                /* duplicate found */
-                return LDB_SUCCESS;
-            }
-        } while (lastop->next);
+    hkey.type = HASH_KEY_STRING;
+    hkey.str = discard_const(key);
+    hret = hash_lookup(add_ctx->dedup_table, &hkey, &hval);
+    if (hret == HASH_SUCCESS) {
+        return LDB_SUCCESS;
     }
 
     addop = talloc_zero(add_ctx, struct mbof_add_operation);
@@ -430,10 +422,18 @@ static int mbof_append_addop(struct mbof_add_ctx *add_ctx,
     addop->parents = parents;
     addop->entry_dn = entry_dn;
 
-    if (add_ctx->add_list) {
-        lastop->next = addop;
+    if (add_ctx->add_list_tail) {
+        add_ctx->add_list_tail->next = addop;
     } else {
         add_ctx->add_list = addop;
+    }
+    add_ctx->add_list_tail = addop;
+
+    hval.type = HASH_VALUE_PTR;
+    hval.ptr = addop;
+    hret = hash_enter(add_ctx->dedup_table, &hkey, &hval);
+    if (hret != HASH_SUCCESS) {
+        return LDB_ERR_OPERATIONS_ERROR;
     }
 
     return LDB_SUCCESS;
