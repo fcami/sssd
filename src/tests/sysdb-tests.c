@@ -3947,6 +3947,125 @@ START_TEST (test_sysdb_memberof_store_large_group)
 }
 END_TEST
 
+START_TEST (test_sysdb_memberof_replace_large_group)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int ret;
+    int i;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create one new user that will be added */
+    data = test_data_new_user(test_ctx,
+                              LARGE_GROUP_USER_BASE + LARGE_GROUP_NUM_MEMBERS);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_user(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store new user");
+
+    /* Replace group membership: drop user 0, add new user.
+     * Members: users 1..N-1 + user N (delta = 2 out of N).
+     * This exercises the O(N^2) nested-loop diff in
+     * mbof_mod_process_membel() LDB_FLAG_MOD_REPLACE case.
+     */
+    data = test_data_new_group(test_ctx, LARGE_GROUP_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+
+    for (i = 1; i <= LARGE_GROUP_NUM_MEMBERS; i++) {
+        username = test_asprintf_fqname(data, test_ctx->domain,
+                                        "testuser%d",
+                                        LARGE_GROUP_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(data, test_ctx->domain->name,
+                                  username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(data->attrs,
+                                       SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add member %d", i);
+    }
+
+    perf_snap_take(&snap_before);
+    ret = test_store_group(data);
+    perf_snap_take(&snap_after);
+    sss_ck_fail_if_msg(ret != EOK, "Could not replace large group");
+    perf_snap_report("replace_group: store (delta=2)",
+                     &snap_before, &snap_after);
+
+    /* Verify memberOf is removed from user 0 */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   LARGE_GROUP_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el == NULL,
+                  "memberOf still set on removed user 0");
+
+    /* Verify memberOf is set on the new user */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   LARGE_GROUP_USER_BASE
+                                       + LARGE_GROUP_NUM_MEMBERS,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find new user");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL,
+                  "memberOf not set on newly added user");
+
+    /* Spot-check: verify actual memberOf DN values */
+    {
+        struct ldb_dn *expected_dn;
+        struct ldb_val check;
+
+        expected_dn = sysdb_group_dn(test_ctx, test_ctx->domain,
+                                     data->groupname);
+        sss_ck_fail_if_msg(expected_dn == NULL, "OOM");
+
+        check.data = (uint8_t *)discard_const(
+            ldb_dn_get_linearized(expected_dn));
+        check.length = strlen((const char *)check.data);
+
+        /* New user's memberOf DN matches the group */
+        ck_assert_msg(ldb_msg_find_val(el, &check) != NULL,
+                      "New user memberOf DN does not match group");
+
+        /* User 500's memberOf DN matches the group */
+        ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                       LARGE_GROUP_USER_BASE + 500,
+                                       all_attrs, &msg);
+        sss_ck_fail_if_msg(ret != EOK, "Could not find user 500");
+
+        el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+        ck_assert_msg(el != NULL,
+                      "memberOf not set on user 500");
+        ck_assert_msg(ldb_msg_find_val(el, &check) != NULL,
+                      "User 500 memberOf DN does not match group");
+    }
+
+    /* Verify memberuid on the group */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    LARGE_GROUP_GID, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find large group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL,
+                  "memberuid not set on large group");
+    ck_assert_msg(el->num_values == LARGE_GROUP_NUM_MEMBERS,
+                  "Expected %d memberuid values, got %d",
+                  LARGE_GROUP_NUM_MEMBERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST (test_sysdb_memberof_store_multi_group)
 {
     struct sysdb_test_ctx *test_ctx;
@@ -8621,6 +8740,7 @@ Suite *create_sysdb_suite(void)
         "SYSDB member/memberof large group Tests");
     tcase_set_timeout(tc_memberof_large, 3600);
     tcase_add_test(tc_memberof_large, test_sysdb_memberof_store_large_group);
+    tcase_add_test(tc_memberof_large, test_sysdb_memberof_replace_large_group);
     tcase_add_test(tc_memberof_large, test_sysdb_memberof_store_multi_group);
     suite_add_tcase(s, tc_memberof_large);
 
