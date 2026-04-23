@@ -43,8 +43,34 @@ struct mbof_dn_array {
     int num;
 };
 
+struct mbof_pending_op {
+    struct mbof_pending_op *next;
+    struct mbof_pending_op *prev;
+    struct ldb_dn *group_dn;
+    struct mbof_dn_array *added;
+};
+
+/* Cross-group batching: when a group modification affects more than
+ * batch_threshold members, memberOf computation is deferred and
+ * flushed either when batch_size pending ops accumulate or at
+ * prepare_commit, whichever comes first.
+ *
+ * SSSD_MEMBEROF_BATCH=0            disables batching (default: enabled)
+ * SSSD_MEMBEROF_BATCH_THRESHOLD=N  per-group member threshold (default: 50)
+ * SSSD_MEMBEROF_BATCH_SIZE=K       flush every K groups (default: 12)
+ *
+ * Could be exposed in sssd.conf should the need arise.
+ */
+#define MBOF_BATCH_THRESHOLD_DEFAULT 50
+#define MBOF_BATCH_SIZE_DEFAULT 4
+
 struct mbof_private {
     bool flushing;
+    bool batch_enabled;
+    int batch_threshold;
+    int batch_size;
+    int pending_count;
+    struct mbof_pending_op *pending_ops;
 };
 
 struct mbof_dn {
@@ -2928,6 +2954,8 @@ static int mbof_inherited_mod(struct mbof_mod_ctx *mod_ctx);
 static int mbof_inherited_mod_callback(struct ldb_request *req,
                                        struct ldb_reply *ares);
 static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done);
+static int mbof_flush_pending_ops(struct ldb_module *module,
+                                  struct mbof_private *priv);
 static int mbof_mod_process_membel(TALLOC_CTX *mem_ctx, struct ldb_context *ldb,
                                    struct ldb_message *entry,
                                    const struct ldb_message_element *membel,
@@ -3480,6 +3508,8 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
 {
     struct ldb_context *ldb;
     struct mbof_ctx *ctx;
+    struct mbof_private *priv;
+    int total;
     int ret;
 
     ctx = mod_ctx->ctx;
@@ -3489,6 +3519,43 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
                                   &mod_ctx->mb_add, &mod_ctx->mb_remove);
     if (ret != LDB_SUCCESS) {
         return ret;
+    }
+
+    /* Check if this operation should be deferred for batch processing.
+     * Only defer additions-only changes (no removals, no ghosts) above
+     * threshold. Removals require transitive closure verification that
+     * the batch path does not implement — they fall through to the
+     * existing per-member path which handles them correctly.
+     * Ghost attribute changes also fall through.
+     */
+    total = 0;
+    if (mod_ctx->mb_add) total += mod_ctx->mb_add->num;
+
+    priv = ldb_module_get_private(ctx->module);
+    if (priv && priv->batch_enabled
+        && total > priv->batch_threshold
+        && (mod_ctx->mb_remove == NULL || mod_ctx->mb_remove->num == 0)
+        && mod_ctx->ghel == NULL) {
+        struct mbof_pending_op *pop;
+
+        pop = talloc_zero(priv, struct mbof_pending_op);
+        if (!pop) {
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+        pop->group_dn = talloc_steal(pop, mod_ctx->entry->dn);
+        pop->added = talloc_steal(pop, mod_ctx->mb_add);
+        DLIST_ADD(priv->pending_ops, pop);
+        priv->pending_count++;
+
+        if (priv->pending_count >= priv->batch_size) {
+            ret = mbof_flush_pending_ops(ctx->module, priv);
+            if (ret != LDB_SUCCESS) {
+                return ret;
+            }
+        }
+
+        *done = true;
+        return LDB_SUCCESS;
     }
 
     ret = mbof_mod_process_ghel(mod_ctx, mod_ctx->entry, mod_ctx->ghel,
@@ -4732,6 +4799,39 @@ static int memberof_init(struct ldb_module *module)
     if (priv == NULL) {
         return LDB_ERR_OPERATIONS_ERROR;
     }
+
+    priv->batch_enabled = true;
+    {
+        const char *env = getenv("SSSD_MEMBEROF_BATCH");
+        if (env && env[0] == '0' && env[1] == '\0') {
+            priv->batch_enabled = false;
+        }
+    }
+
+    priv->batch_threshold = MBOF_BATCH_THRESHOLD_DEFAULT;
+    {
+        const char *env = getenv("SSSD_MEMBEROF_BATCH_THRESHOLD");
+        if (env) {
+            char *endptr;
+            long val = strtol(env, &endptr, 10);
+            if (*endptr == '\0' && val > 0) {
+                priv->batch_threshold = (int)val;
+            }
+        }
+    }
+
+    priv->batch_size = MBOF_BATCH_SIZE_DEFAULT;
+    {
+        const char *env = getenv("SSSD_MEMBEROF_BATCH_SIZE");
+        if (env) {
+            char *endptr;
+            long val = strtol(env, &endptr, 10);
+            if (*endptr == '\0' && val > 0) {
+                priv->batch_size = (int)val;
+            }
+        }
+    }
+
     ldb_module_set_private(module, priv);
 
     ret = ldb_schema_attribute_add(ldb, DB_MEMBER, 0, LDB_SYNTAX_DN);
@@ -4748,12 +4848,330 @@ static int memberof_start_transaction(struct ldb_module *module)
     struct mbof_private *priv = ldb_module_get_private(module);
     if (priv) {
         priv->flushing = false;
+        priv->pending_count = 0;
+        priv->pending_ops = NULL;
     }
     return ldb_next_start_trans(module);
 }
 
+static int mbof_flush_pending_ops(struct ldb_module *module,
+                                  struct mbof_private *priv)
+{
+    struct ldb_context *ldb = ldb_module_get_ctx(module);
+    struct mbof_pending_op *pop;
+    hash_table_t *user_map;
+    hash_table_t *group_memberuids;
+    hash_key_t hkey;
+    hash_value_t hval;
+    hash_entry_t *entries;
+    unsigned long count;
+    int hret;
+    int ret;
+    int i;
+
+    /* user_map: casefolded user DN → hash_table of casefolded group DNs
+     * (net memberOf set to ADD for this user).
+     * group_memberuids: casefolded group DN → hash_table of usernames
+     * (net memberuid set for this group).
+     */
+    ret = hash_create_ex(4096, &user_map, 0, 0, 0, 0,
+                         hash_alloc, hash_free, priv, NULL, NULL);
+    if (ret != HASH_SUCCESS) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    ret = hash_create_ex(256, &group_memberuids, 0, 0, 0, 0,
+                         hash_alloc, hash_free, priv, NULL, NULL);
+    if (ret != HASH_SUCCESS) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    /* Phase 1: accumulate all pending ops into per-user group sets */
+    for (pop = priv->pending_ops; pop; pop = pop->next) {
+        const char *group_cf;
+        struct ldb_dn *group_dn_obj;
+
+        group_dn_obj = pop->group_dn;
+        group_cf = ldb_dn_get_casefold(group_dn_obj);
+        if (!group_cf) {
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+
+        if (pop->added) {
+            for (i = 0; i < pop->added->num; i++) {
+                const char *user_cf;
+                hash_table_t *grp_set;
+
+                user_cf = ldb_dn_get_casefold(pop->added->dns[i]);
+                if (!user_cf) {
+                    return LDB_ERR_OPERATIONS_ERROR;
+                }
+
+                hkey.type = HASH_KEY_STRING;
+                hkey.str = discard_const(user_cf);
+                hret = hash_lookup(user_map, &hkey, &hval);
+                if (hret == HASH_SUCCESS) {
+                    grp_set = (hash_table_t *)hval.ptr;
+                } else {
+                    hret = hash_create_ex(16, &grp_set, 0, 0, 0, 0,
+                                          hash_alloc, hash_free,
+                                          priv, NULL, NULL);
+                    if (hret != HASH_SUCCESS) {
+                        return LDB_ERR_OPERATIONS_ERROR;
+                    }
+                    hval.type = HASH_VALUE_PTR;
+                    hval.ptr = grp_set;
+                    hash_enter(user_map, &hkey, &hval);
+                }
+
+                hkey.type = HASH_KEY_STRING;
+                hkey.str = discard_const(group_cf);
+                hval.type = HASH_VALUE_PTR;
+                hval.ptr = pop->group_dn;
+                hash_enter(grp_set, &hkey, &hval);
+            }
+        }
+
+        /* Removals are not deferred — they fall through to the
+         * per-member path which handles transitive closure correctly.
+         */
+    }
+
+    /* Phase 2: for each affected user, read current memberOf,
+     * compute new memberOf, emit one modify.
+     * Also collect memberuid for each group.
+     */
+    priv->flushing = true;
+
+    hret = hash_entries(user_map, &count, &entries);
+    if (hret != HASH_SUCCESS) {
+        priv->flushing = false;
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+
+    for (i = 0; i < (int)count; i++) {
+        const char *user_cf = entries[i].key.str;
+        hash_table_t *grp_set = (hash_table_t *)entries[i].value.ptr;
+        hash_entry_t *grp_entries;
+        unsigned long grp_count;
+        struct ldb_result *res = NULL;
+        struct ldb_message *msg;
+        struct ldb_message_element *el;
+        struct ldb_dn *user_dn;
+        const struct ldb_message_element *existing_mo;
+        int j;
+
+        if (hash_count(grp_set) == 0) {
+            continue;
+        }
+
+        user_dn = ldb_dn_new(priv, ldb, user_cf);
+        if (!user_dn) {
+            priv->flushing = false;
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+
+        /* Read current entry to get existing memberOf and name */
+        ret = ldb_search(ldb, priv, &res, user_dn, LDB_SCOPE_BASE,
+                         NULL, NULL);
+        if (ret != LDB_SUCCESS || res->count == 0) {
+            talloc_free(user_dn);
+            continue;
+        }
+
+        /* Collect username for memberuid */
+        const char *username = ldb_msg_find_attr_as_string(
+            res->msgs[0], DB_NAME, NULL);
+        if (username) {
+            hret = hash_entries(grp_set, &grp_count, &grp_entries);
+            if (hret == HASH_SUCCESS) {
+                for (j = 0; j < (int)grp_count; j++) {
+                    struct ldb_dn *gdn =
+                        (struct ldb_dn *)grp_entries[j].value.ptr;
+                    const char *gcf = ldb_dn_get_casefold(gdn);
+                    hash_table_t *uid_set;
+
+                    hkey.type = HASH_KEY_STRING;
+                    hkey.str = discard_const(gcf);
+                    hret = hash_lookup(group_memberuids, &hkey, &hval);
+                    if (hret == HASH_SUCCESS) {
+                        uid_set = (hash_table_t *)hval.ptr;
+                    } else {
+                        hret = hash_create_ex(1024, &uid_set, 0, 0, 0, 0,
+                                              hash_alloc, hash_free,
+                                              priv, NULL, NULL);
+                        if (hret != HASH_SUCCESS) {
+                            priv->flushing = false;
+                            return LDB_ERR_OPERATIONS_ERROR;
+                        }
+                        hval.type = HASH_VALUE_PTR;
+                        hval.ptr = uid_set;
+                        hash_enter(group_memberuids, &hkey, &hval);
+                    }
+
+                    hkey.type = HASH_KEY_STRING;
+                    hkey.str = discard_const(username);
+                    hval.type = HASH_VALUE_INT;
+                    hval.i = 1;
+                    hash_enter(uid_set, &hkey, &hval);
+                }
+            }
+        }
+
+        /* Build memberOf modify: ADD new group DNs */
+        hret = hash_entries(grp_set, &grp_count, &grp_entries);
+        if (hret != HASH_SUCCESS || grp_count == 0) {
+            talloc_free(res);
+            talloc_free(user_dn);
+            continue;
+        }
+
+        /* Check if these groups are already in the user's memberOf */
+        existing_mo = ldb_msg_find_element(res->msgs[0], DB_MEMBEROF);
+
+        msg = ldb_msg_new(priv);
+        if (!msg) {
+            priv->flushing = false;
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+        msg->dn = user_dn;
+
+        ret = ldb_msg_add_empty(msg, DB_MEMBEROF, LDB_FLAG_MOD_ADD, &el);
+        if (ret != LDB_SUCCESS) {
+            priv->flushing = false;
+            return ret;
+        }
+
+        el->values = talloc_array(el, struct ldb_val, grp_count);
+        if (!el->values) {
+            priv->flushing = false;
+            return LDB_ERR_OPERATIONS_ERROR;
+        }
+
+        el->num_values = 0;
+        for (j = 0; j < (int)grp_count; j++) {
+            struct ldb_dn *gdn =
+                (struct ldb_dn *)grp_entries[j].value.ptr;
+            const char *val = ldb_dn_get_linearized(gdn);
+            bool already = false;
+
+            if (existing_mo) {
+                struct ldb_val check;
+                check.data = (uint8_t *)discard_const(val);
+                check.length = strlen(val);
+                if (ldb_msg_find_val(existing_mo, &check)) {
+                    already = true;
+                }
+            }
+
+            if (!already) {
+                el->values[el->num_values].data =
+                    (uint8_t *)talloc_strdup(el->values, val);
+                el->values[el->num_values].length = strlen(val);
+                el->num_values++;
+            }
+        }
+
+        if (el->num_values > 0) {
+            ret = ldb_modify(ldb, msg);
+            if (ret != LDB_SUCCESS) {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "Failed to batch-add memberOf to %s: %s\n",
+                      ldb_dn_get_linearized(user_dn),
+                      ldb_errstring(ldb));
+            }
+        }
+
+        talloc_free(msg);
+        talloc_free(res);
+    }
+
+    /* Phase 3: for each group, emit batched memberuid ADD */
+    hret = hash_entries(group_memberuids, &count, &entries);
+    if (hret == HASH_SUCCESS) {
+        for (i = 0; i < (int)count; i++) {
+            hash_table_t *uid_set =
+                (hash_table_t *)entries[i].value.ptr;
+            hash_entry_t *uid_entries;
+            unsigned long uid_count;
+            struct ldb_message *msg;
+            struct ldb_message_element *el;
+            struct ldb_dn *gdn;
+            int j;
+
+            hret = hash_entries(uid_set, &uid_count, &uid_entries);
+            if (hret != HASH_SUCCESS || uid_count == 0) {
+                continue;
+            }
+
+            gdn = ldb_dn_new(priv, ldb, entries[i].key.str);
+            if (!gdn) continue;
+
+            msg = ldb_msg_new(priv);
+            if (!msg) {
+                priv->flushing = false;
+                return LDB_ERR_OPERATIONS_ERROR;
+            }
+            msg->dn = gdn;
+
+            ret = ldb_msg_add_empty(msg, DB_MEMBERUID,
+                                    LDB_FLAG_MOD_ADD, &el);
+            if (ret != LDB_SUCCESS) {
+                priv->flushing = false;
+                return ret;
+            }
+
+            el->values = talloc_array(el, struct ldb_val, uid_count);
+            if (!el->values) {
+                priv->flushing = false;
+                return LDB_ERR_OPERATIONS_ERROR;
+            }
+            el->num_values = uid_count;
+
+            for (j = 0; j < (int)uid_count; j++) {
+                el->values[j].data =
+                    (uint8_t *)uid_entries[j].key.str;
+                el->values[j].length = strlen(uid_entries[j].key.str);
+            }
+
+            ret = ldb_modify(ldb, msg);
+            if (ret != LDB_SUCCESS) {
+                DEBUG(SSSDBG_MINOR_FAILURE,
+                      "Failed to batch-add memberuid to %s: %s\n",
+                      ldb_dn_get_linearized(gdn),
+                      ldb_errstring(ldb));
+            }
+
+            talloc_free(msg);
+        }
+    }
+
+    priv->flushing = false;
+    talloc_free(user_map);
+    talloc_free(group_memberuids);
+
+    /* Free all pending ops */
+    while (priv->pending_ops) {
+        struct mbof_pending_op *pop = priv->pending_ops;
+        DLIST_REMOVE(priv->pending_ops, pop);
+        talloc_free(pop);
+    }
+    priv->pending_count = 0;
+
+    return LDB_SUCCESS;
+}
+
 static int memberof_prepare_commit(struct ldb_module *module)
 {
+    struct mbof_private *priv = ldb_module_get_private(module);
+
+    if (priv && priv->pending_ops) {
+        int ret = mbof_flush_pending_ops(module, priv);
+        if (ret != LDB_SUCCESS) {
+            return ret;
+        }
+    }
+
     return ldb_next_prepare_commit(module);
 }
 
