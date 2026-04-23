@@ -78,6 +78,8 @@ struct mbof_add_ctx {
     struct mbof_add_operation *add_list;
     struct mbof_add_operation *current_op;
 
+    hash_table_t *dedup_table;
+
     struct ldb_message *msg;
     struct ldb_dn *msg_dn;
     bool terminate;
@@ -556,6 +558,12 @@ static int memberof_add(struct ldb_module *module, struct ldb_request *req)
         return LDB_ERR_OPERATIONS_ERROR;
     }
     add_ctx->ctx = ctx;
+
+    ret = hash_create_ex(1024, &add_ctx->dedup_table, 0, 0, 0, 0,
+                         hash_alloc, hash_free, add_ctx, NULL, NULL);
+    if (ret != HASH_SUCCESS) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
 
     add_ctx->msg = ldb_msg_copy(add_ctx, req->op.add.message);
     if (!add_ctx->msg) {
@@ -3737,6 +3745,12 @@ static int mbof_mod_add(struct mbof_mod_ctx *mod_ctx,
     }
     add_ctx->ctx = ctx;
     add_ctx->msg_dn = mod_ctx->msg->dn;
+
+    ret = hash_create_ex(1024, &add_ctx->dedup_table, 0, 0, 0, 0,
+                         hash_alloc, hash_free, add_ctx, NULL, NULL);
+    if (ret != HASH_SUCCESS) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
 
     if (addgh != NULL) {
         /* Build the memberuid add op */
