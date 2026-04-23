@@ -43,6 +43,10 @@ struct mbof_dn_array {
     int num;
 };
 
+struct mbof_private {
+    bool flushing;
+};
+
 struct mbof_dn {
     struct mbof_dn *next;
     struct ldb_dn *dn;
@@ -2962,8 +2966,14 @@ static int memberof_mod(struct ldb_module *module, struct ldb_request *req)
     int ret;
 
     if (getenv("SSSD_UPGRADE_DB")) {
-        /* do not do anything during upgrade */
         return ldb_next_request(module, req);
+    }
+
+    {
+        struct mbof_private *priv = ldb_module_get_private(module);
+        if (priv && priv->flushing) {
+            return ldb_next_request(module, req);
+        }
     }
 
     if (ldb_dn_is_special(req->op.mod.message->dn)) {
@@ -4712,10 +4722,15 @@ static int mbof_rcmp_mod_callback(struct ldb_request *req,
 static int memberof_init(struct ldb_module *module)
 {
     struct ldb_context *ldb = ldb_module_get_ctx(module);
+    struct mbof_private *priv;
     int ret;
 
-    /* set syntaxes for member and memberof so that comparisons in filters and
-     * such are done right */
+    priv = talloc_zero(module, struct mbof_private);
+    if (priv == NULL) {
+        return LDB_ERR_OPERATIONS_ERROR;
+    }
+    ldb_module_set_private(module, priv);
+
     ret = ldb_schema_attribute_add(ldb, DB_MEMBER, 0, LDB_SYNTAX_DN);
     if (ret != 0) return LDB_ERR_OPERATIONS_ERROR;
 
@@ -4725,12 +4740,40 @@ static int memberof_init(struct ldb_module *module)
     return ldb_next_init(module);
 }
 
+static int memberof_start_transaction(struct ldb_module *module)
+{
+    struct mbof_private *priv = ldb_module_get_private(module);
+    if (priv) {
+        priv->flushing = false;
+    }
+    return ldb_next_start_trans(module);
+}
+
+static int memberof_prepare_commit(struct ldb_module *module)
+{
+    return ldb_next_prepare_commit(module);
+}
+
+static int memberof_end_transaction(struct ldb_module *module)
+{
+    return ldb_next_end_trans(module);
+}
+
+static int memberof_del_transaction(struct ldb_module *module)
+{
+    return ldb_next_del_trans(module);
+}
+
 const struct ldb_module_ops ldb_memberof_module_ops = {
     .name = "memberof",
     .init_context = memberof_init,
     .add = memberof_add,
     .modify = memberof_mod,
     .del = memberof_del,
+    .start_transaction = memberof_start_transaction,
+    .prepare_commit = memberof_prepare_commit,
+    .end_transaction = memberof_end_transaction,
+    .del_transaction = memberof_del_transaction,
 };
 
 int ldb_init_module(const char *version)
