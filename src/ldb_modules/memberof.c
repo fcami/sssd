@@ -33,6 +33,12 @@
 #define DB_CACHE_EXPIRE "dataExpireTimestamp"
 #define DB_OC "objectCategory"
 
+/* When this control is present on a request, memberof_mod and
+ * memberof_add pass through without computing memberOf/memberuid.
+ * Must match the define in sysdb_private.h.
+ */
+#define SYSDB_MEMBEROF_BYPASS "SSSD_MEMBEROF_BYPASS"
+
 struct mbof_val_array {
     struct ldb_val *vals;
     int num;
@@ -550,6 +556,10 @@ static int memberof_add(struct ldb_module *module, struct ldb_request *req)
     struct mbof_dn_array *parents;
     struct ldb_dn *valdn;
     int i, ret;
+
+    if (ldb_request_get_control(req, SYSDB_MEMBEROF_BYPASS)) {
+        return ldb_next_request(module, req);
+    }
 
     if (ldb_dn_is_special(req->op.add.message->dn)) {
 
@@ -3002,6 +3012,10 @@ static int memberof_mod(struct ldb_module *module, struct ldb_request *req)
         if (priv && priv->flushing) {
             return ldb_next_request(module, req);
         }
+    }
+
+    if (ldb_request_get_control(req, SYSDB_MEMBEROF_BYPASS)) {
+        return ldb_next_request(module, req);
     }
 
     if (ldb_dn_is_special(req->op.mod.message->dn)) {
