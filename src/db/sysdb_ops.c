@@ -2442,6 +2442,366 @@ fail:
     return ret;
 }
 
+/* Issue an ldb_modify with the memberof bypass control.
+ * Caller must have an active sysdb transaction.
+ */
+static int sysdb_memberof_bypass_mod(struct sss_domain_info *domain,
+                                     struct ldb_message *msg)
+{
+    struct ldb_request *req;
+    int ret;
+
+    ret = ldb_build_mod_req(&req, domain->sysdb->ldb, msg,
+                            msg, NULL, NULL,
+                            ldb_op_default_callback, NULL);
+    if (ret != LDB_SUCCESS) {
+        return sysdb_error_to_errno(ret);
+    }
+
+    ret = ldb_request_add_control(req, SYSDB_MEMBEROF_BYPASS,
+                                  false, NULL);
+    if (ret != LDB_SUCCESS) {
+        talloc_free(req);
+        return sysdb_error_to_errno(ret);
+    }
+
+    ret = ldb_request_add_control(req, LDB_CONTROL_PERMISSIVE_MODIFY_OID,
+                                  false, NULL);
+    if (ret != LDB_SUCCESS) {
+        talloc_free(req);
+        return sysdb_error_to_errno(ret);
+    }
+
+    ret = ldb_request(domain->sysdb->ldb, req);
+    if (ret == LDB_SUCCESS) {
+        ret = ldb_wait(req->handle, LDB_WAIT_ALL);
+    }
+    talloc_free(req);
+
+    if (ret != LDB_SUCCESS) {
+        DEBUG(SSSDBG_MINOR_FAILURE,
+              "bypass ldb_modify failed: [%s](%d)[%s]\n",
+              ldb_strerror(ret), ret,
+              ldb_errstring(domain->sysdb->ldb));
+    }
+    return sysdb_error_to_errno(ret);
+}
+
+int sysdb_store_group_members(struct sss_domain_info *domain,
+                              const char *group_name,
+                              struct sysdb_attrs *group_attrs,
+                              gid_t gid)
+{
+    TALLOC_CTX *tmp_ctx;
+    struct ldb_dn *group_dn;
+    struct ldb_message *msg;
+    struct ldb_message_element *el;
+    const struct ldb_message_element *new_members_el;
+    const struct ldb_message_element *old_members_el;
+    struct ldb_result *grp_res = NULL;
+    struct ldb_result *usr_res = NULL;
+    hash_table_t *old_set = NULL;
+    hash_key_t hkey;
+    hash_value_t hval;
+    const char *all_attrs[] = { "*", NULL };
+    bool in_transaction = false;
+    int ret;
+    int i;
+    int hret;
+
+    if (group_attrs == NULL) {
+        return EOK;
+    }
+
+    new_members_el = NULL;
+    for (i = 0; i < group_attrs->num; i++) {
+        if (strcasecmp(group_attrs->a[i].name, SYSDB_MEMBER) == 0) {
+            new_members_el = &group_attrs->a[i];
+            break;
+        }
+    }
+    if (new_members_el == NULL || new_members_el->num_values == 0) {
+        return EOK;
+    }
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        return ENOMEM;
+    }
+
+    group_dn = sysdb_group_dn(tmp_ctx, domain, group_name);
+    if (group_dn == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    ret = sysdb_transaction_start(domain->sysdb);
+    if (ret != EOK) {
+        goto done;
+    }
+    in_transaction = true;
+
+    /* Read current group entry to get old member list */
+    ret = ldb_search(domain->sysdb->ldb, tmp_ctx, &grp_res,
+                     group_dn, LDB_SCOPE_BASE, all_attrs, NULL);
+    if (ret != LDB_SUCCESS) {
+        ret = sysdb_error_to_errno(ret);
+        goto done;
+    }
+
+    old_members_el = NULL;
+    if (grp_res->count > 0) {
+        old_members_el = ldb_msg_find_element(grp_res->msgs[0],
+                                              SYSDB_MEMBER);
+    }
+
+    /* Build hash set of old members for O(1) lookup */
+    hret = hash_create(new_members_el->num_values * 2, &old_set,
+                       NULL, NULL);
+    if (hret != HASH_SUCCESS) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    if (old_members_el) {
+        for (i = 0; i < old_members_el->num_values; i++) {
+            hkey.type = HASH_KEY_STRING;
+            hkey.str = (char *)old_members_el->values[i].data;
+            hval.type = HASH_VALUE_INT;
+            hval.i = 1;
+            hash_enter(old_set, &hkey, &hval);
+        }
+    }
+
+    /* Write the new member list to the group so subsequent calls
+     * can diff against it. Uses REPLACE to set the full list.
+     */
+    msg = ldb_msg_new(tmp_ctx);
+    if (msg == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    msg->dn = group_dn;
+
+    ret = ldb_msg_add_empty(msg, SYSDB_MEMBER, LDB_FLAG_MOD_REPLACE, &el);
+    if (ret != LDB_SUCCESS) {
+        ret = sysdb_error_to_errno(ret);
+        goto done;
+    }
+    el->values = talloc_array(el, struct ldb_val, new_members_el->num_values);
+    if (el->values == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    for (i = 0; i < (int)new_members_el->num_values; i++) {
+        el->values[i] = new_members_el->values[i];
+    }
+    el->num_values = new_members_el->num_values;
+
+    ret = sysdb_memberof_bypass_mod(domain, msg);
+    if (ret != EOK) {
+        goto done;
+    }
+
+    /* For each new member not in the old set: add memberOf */
+    for (i = 0; i < (int)new_members_el->num_values; i++) {
+        const char *member_dn_str;
+        struct ldb_dn *member_dn;
+        const char *username;
+
+        member_dn_str = (const char *)new_members_el->values[i].data;
+
+        hkey.type = HASH_KEY_STRING;
+        hkey.str = discard_const(member_dn_str);
+        hret = hash_lookup(old_set, &hkey, &hval);
+        if (hret == HASH_SUCCESS) {
+            hash_delete(old_set, &hkey);
+            continue;
+        }
+
+        /* New member — add memberOf pointing to this group */
+        member_dn = ldb_dn_new(tmp_ctx, domain->sysdb->ldb,
+                               member_dn_str);
+        if (member_dn == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        msg = ldb_msg_new(tmp_ctx);
+        if (msg == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        msg->dn = member_dn;
+
+        ret = ldb_msg_add_empty(msg, SYSDB_MEMBEROF,
+                                LDB_FLAG_MOD_ADD, &el);
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done;
+        }
+        ret = ldb_msg_add_string(msg, SYSDB_MEMBEROF,
+                                 ldb_dn_get_linearized(group_dn));
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done;
+        }
+
+        ret = sysdb_memberof_bypass_mod(domain, msg);
+        if (ret != EOK) {
+            goto done;
+        }
+
+        /* Collect username for memberuid */
+        member_dn = ldb_dn_new(tmp_ctx, domain->sysdb->ldb,
+                               member_dn_str);
+        ret = ldb_search(domain->sysdb->ldb, tmp_ctx, &usr_res,
+                         member_dn, LDB_SCOPE_BASE, all_attrs, NULL);
+        if (ret == LDB_SUCCESS && usr_res->count > 0) {
+            username = ldb_msg_find_attr_as_string(usr_res->msgs[0],
+                                                   SYSDB_NAME, NULL);
+            if (username) {
+                msg = ldb_msg_new(tmp_ctx);
+                if (msg == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                msg->dn = group_dn;
+                ret = ldb_msg_add_empty(msg, SYSDB_MEMBERUID,
+                                        LDB_FLAG_MOD_ADD, &el);
+                if (ret != LDB_SUCCESS) {
+                    ret = sysdb_error_to_errno(ret);
+                    goto done;
+                }
+                ret = ldb_msg_add_string(msg, SYSDB_MEMBERUID,
+                                         username);
+                if (ret != LDB_SUCCESS) {
+                    ret = sysdb_error_to_errno(ret);
+                    goto done;
+                }
+                ret = sysdb_memberof_bypass_mod(domain, msg);
+                if (ret != EOK) {
+                    goto done;
+                }
+            }
+        }
+    }
+
+    /* For each old member not in new set: remove memberOf and
+     * collect usernames for batched memberuid removal.
+     */
+    if (old_members_el) {
+        struct ldb_message *uid_del_msg = NULL;
+        struct ldb_message_element *uid_del_el = NULL;
+        int del_count = 0;
+
+        uid_del_msg = ldb_msg_new(tmp_ctx);
+        if (uid_del_msg == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        uid_del_msg->dn = group_dn;
+        ret = ldb_msg_add_empty(uid_del_msg, SYSDB_MEMBERUID,
+                                LDB_FLAG_MOD_DELETE, &uid_del_el);
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done;
+        }
+
+        for (i = 0; i < old_members_el->num_values; i++) {
+            const char *member_dn_str;
+            struct ldb_dn *member_dn;
+            const char *rm_name;
+
+            member_dn_str = (const char *)old_members_el->values[i].data;
+            hkey.type = HASH_KEY_STRING;
+            hkey.str = discard_const(member_dn_str);
+            hret = hash_lookup(old_set, &hkey, &hval);
+            if (hret != HASH_SUCCESS) {
+                continue;
+            }
+
+            /* This member was removed — delete its memberOf */
+            member_dn = ldb_dn_new(tmp_ctx, domain->sysdb->ldb,
+                                   member_dn_str);
+            if (member_dn == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+
+            msg = ldb_msg_new(tmp_ctx);
+            if (msg == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            msg->dn = member_dn;
+
+            ret = ldb_msg_add_empty(msg, SYSDB_MEMBEROF,
+                                    LDB_FLAG_MOD_DELETE, &el);
+            if (ret != LDB_SUCCESS) {
+                ret = sysdb_error_to_errno(ret);
+                goto done;
+            }
+            ret = ldb_msg_add_string(msg, SYSDB_MEMBEROF,
+                                     ldb_dn_get_linearized(group_dn));
+            if (ret != LDB_SUCCESS) {
+                ret = sysdb_error_to_errno(ret);
+                goto done;
+            }
+
+            ret = sysdb_memberof_bypass_mod(domain, msg);
+            if (ret != EOK) {
+                goto done;
+            }
+
+            /* Collect username for memberuid removal */
+            rm_name = NULL;
+            if (ldb_dn_get_comp_num(member_dn) > 0) {
+                const struct ldb_val *v;
+                v = ldb_dn_get_component_val(member_dn, 0);
+                if (v && v->data) {
+                    rm_name = (const char *)v->data;
+                }
+            }
+            if (rm_name) {
+                ret = ldb_msg_add_string(uid_del_msg, SYSDB_MEMBERUID,
+                                         rm_name);
+                if (ret != LDB_SUCCESS) {
+                    ret = sysdb_error_to_errno(ret);
+                    goto done;
+                }
+                del_count++;
+            }
+        }
+
+        /* Emit batched memberuid DELETE for removed members */
+        if (del_count > 0) {
+            ret = sysdb_memberof_bypass_mod(domain, uid_del_msg);
+            if (ret != EOK) {
+                goto done;
+            }
+        }
+    }
+
+    ret = sysdb_transaction_commit(domain->sysdb);
+    if (ret != EOK) {
+        goto done;
+    }
+    in_transaction = false;
+
+    if (old_set) hash_destroy(old_set);
+    talloc_free(tmp_ctx);
+    return EOK;
+
+done:
+    if (in_transaction) {
+        sysdb_transaction_cancel(domain->sysdb);
+    }
+    if (old_set) hash_destroy(old_set);
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
 /* =Add-Basic-Netgroup-NO-CHECKS============================================= */
 
 int sysdb_add_basic_netgroup(struct sss_domain_info *domain,

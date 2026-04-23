@@ -4273,6 +4273,98 @@ START_TEST (test_sysdb_memberof_many_groups_same_users)
 }
 END_TEST
 
+#define SYSDB_PATH_USER_BASE 90000
+#define SYSDB_PATH_GID 95000
+#define SYSDB_PATH_NUM_MEMBERS 200
+
+START_TEST (test_sysdb_store_group_members_basic)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int ret;
+    int i;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    for (i = 0; i < SYSDB_PATH_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  SYSDB_PATH_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+
+    /* Create empty group first */
+    data = test_data_new_group(test_ctx, SYSDB_PATH_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store group");
+
+    /* Build attrs with member DNs */
+    attrs = sysdb_new_attrs(test_ctx);
+    sss_ck_fail_if_msg(attrs == NULL, "OOM");
+
+    for (i = 0; i < SYSDB_PATH_NUM_MEMBERS; i++) {
+        username = test_asprintf_fqname(test_ctx, test_ctx->domain,
+                                        "testuser%d",
+                                        SYSDB_PATH_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(test_ctx,
+                                  test_ctx->domain->name,
+                                  username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Failed to add member %d", i);
+    }
+
+    /* Store members via the new sysdb path */
+    perf_snap_take(&snap_before);
+    ret = sysdb_store_group_members(test_ctx->domain,
+                                    data->groupname, attrs,
+                                    SYSDB_PATH_GID);
+    perf_snap_take(&snap_after);
+    sss_ck_fail_if_msg(ret != EOK,
+                       "sysdb_store_group_members failed");
+    perf_snap_report("sysdb_path: store members",
+                     &snap_before, &snap_after);
+
+    /* Verify memberOf on user 0 */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   SYSDB_PATH_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on user 0");
+
+    /* Verify memberuid on the group */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    SYSDB_PATH_GID,
+                                    all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "memberuid not set on group");
+    ck_assert_msg(el->num_values == SYSDB_PATH_NUM_MEMBERS,
+                  "Expected %d memberuid, got %d",
+                  SYSDB_PATH_NUM_MEMBERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST (test_sysdb_set_get_bool)
 {
     struct sysdb_test_ctx *test_ctx;
@@ -8749,6 +8841,12 @@ Suite *create_sysdb_suite(void)
     tcase_set_timeout(tc_memberof_many, 3600);
     tcase_add_test(tc_memberof_many, test_sysdb_memberof_many_groups_same_users);
     suite_add_tcase(s, tc_memberof_many);
+
+    TCase *tc_sysdb_path = tcase_create(
+        "SYSDB member/memberof sysdb-path Tests");
+    tcase_set_timeout(tc_sysdb_path, 3600);
+    tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_basic);
+    suite_add_tcase(s, tc_sysdb_path);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
 

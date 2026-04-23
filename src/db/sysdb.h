@@ -1225,6 +1225,26 @@ int sysdb_store_group(struct sss_domain_info *domain,
                       uint64_t cache_timeout,
                       time_t now);
 
+/* Store group membership via the sysdb bypass path.
+ * Computes memberOf and memberuid in application code, bypassing
+ * the memberof LDB module. The group must already exist.
+ *
+ * Assumptions:
+ * - All member DNs in group_attrs are user entries (no nested groups).
+ *   Nested group DNs will get incorrect memberuid entries and miss
+ *   transitive memberOf propagation.
+ * - Single-level memberOf only — no transitive closure. Callers must
+ *   provide complete, flattened member lists.
+ * - The SYSDB_MEMBEROF_BYPASS LDB control is used on all modifies
+ *   to skip the memberof module entirely.
+ * - Transaction chunking may leave partial state on failure.
+ *   A cache refresh or memberof recompute repairs any inconsistency.
+ */
+int sysdb_store_group_members(struct sss_domain_info *domain,
+                              const char *group_name,
+                              struct sysdb_attrs *group_attrs,
+                              gid_t gid);
+
 int sysdb_add_group_member(struct sss_domain_info *domain,
                            const char *group,
                            const char *member,
