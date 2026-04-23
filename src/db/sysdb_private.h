@@ -307,4 +307,10 @@ bool sysdb_entry_attrs_diff(struct sysdb_ctx *sysdb,
                             struct sysdb_attrs *attrs,
                             int mod_op);
 
+/* LDB control: when present on a modify/add request, the memberof
+ * LDB module passes through without computing memberOf/memberuid.
+ * Used by the sysdb layer when it computes memberOf in application code.
+ */
+#define SYSDB_MEMBEROF_BYPASS "SSSD_MEMBEROF_BYPASS"
+
 #endif /* __INT_SYS_DB_H__ */
