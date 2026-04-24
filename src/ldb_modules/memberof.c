@@ -4884,10 +4884,25 @@ static int memberof_start_transaction(struct ldb_module *module)
     return ldb_next_start_trans(module);
 }
 
+static void mbof_free_pending_ops(struct mbof_private *priv)
+{
+    struct mbof_pending_op *pop, *next;
+    if (priv == NULL) return;
+    pop = priv->pending_ops;
+    while (pop) {
+        next = pop->next;
+        talloc_free(pop);
+        pop = next;
+    }
+    priv->pending_ops = NULL;
+    priv->pending_count = 0;
+}
+
 static int mbof_flush_pending_ops(struct ldb_module *module,
                                   struct mbof_private *priv)
 {
     struct ldb_context *ldb = ldb_module_get_ctx(module);
+    TALLOC_CTX *tmp_ctx;
     struct mbof_pending_op *pop;
     hash_table_t *user_map;
     hash_table_t *group_memberuids;
@@ -4899,21 +4914,22 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
     int ret;
     int i;
 
-    /* user_map: casefolded user DN → hash_table of casefolded group DNs
-     * (net memberOf set to ADD for this user).
-     * group_memberuids: casefolded group DN → hash_table of usernames
-     * (net memberuid set for this group).
-     */
+    tmp_ctx = talloc_new(priv);
+    if (tmp_ctx == NULL) {
+        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
+    }
+
     ret = hash_create_ex(4096, &user_map, 0, 0, 0, 0,
-                         hash_alloc, hash_free, priv, NULL, NULL);
+                         hash_alloc, hash_free, tmp_ctx, NULL, NULL);
     if (ret != HASH_SUCCESS) {
-        return LDB_ERR_OPERATIONS_ERROR;
+        talloc_free(tmp_ctx);
+        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
     }
 
     ret = hash_create_ex(256, &group_memberuids, 0, 0, 0, 0,
-                         hash_alloc, hash_free, priv, NULL, NULL);
+                         hash_alloc, hash_free, tmp_ctx, NULL, NULL);
     if (ret != HASH_SUCCESS) {
-        return LDB_ERR_OPERATIONS_ERROR;
+        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
     }
 
     /* Phase 1: accumulate all pending ops into per-user group sets */
@@ -4924,7 +4940,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
         group_dn_obj = pop->group_dn;
         group_cf = ldb_dn_get_casefold(group_dn_obj);
         if (!group_cf) {
-            return LDB_ERR_OPERATIONS_ERROR;
+            ret = LDB_ERR_OPERATIONS_ERROR; goto done;
         }
 
         if (pop->added) {
@@ -4934,7 +4950,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
 
                 user_cf = ldb_dn_get_casefold(pop->added->dns[i]);
                 if (!user_cf) {
-                    return LDB_ERR_OPERATIONS_ERROR;
+                    ret = LDB_ERR_OPERATIONS_ERROR; goto done;
                 }
 
                 hkey.type = HASH_KEY_STRING;
@@ -4947,7 +4963,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
                                           hash_alloc, hash_free,
                                           priv, NULL, NULL);
                     if (hret != HASH_SUCCESS) {
-                        return LDB_ERR_OPERATIONS_ERROR;
+                        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
                     }
                     hval.type = HASH_VALUE_PTR;
                     hval.ptr = grp_set;
@@ -4976,7 +4992,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
     hret = hash_entries(user_map, &count, &entries);
     if (hret != HASH_SUCCESS) {
         priv->flushing = false;
-        return LDB_ERR_OPERATIONS_ERROR;
+        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
     }
 
     for (i = 0; i < (int)count; i++) {
@@ -4998,7 +5014,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
         user_dn = ldb_dn_new(priv, ldb, user_cf);
         if (!user_dn) {
             priv->flushing = false;
-            return LDB_ERR_OPERATIONS_ERROR;
+            ret = LDB_ERR_OPERATIONS_ERROR; goto done;
         }
 
         /* Read current entry to get existing memberOf and name */
@@ -5035,7 +5051,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
                                               priv, NULL, NULL);
                         if (hret != HASH_SUCCESS) {
                             priv->flushing = false;
-                            return LDB_ERR_OPERATIONS_ERROR;
+                            ret = LDB_ERR_OPERATIONS_ERROR; goto done;
                         }
                         hval.type = HASH_VALUE_PTR;
                         hval.ptr = uid_set;
@@ -5065,7 +5081,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
         msg = ldb_msg_new(priv);
         if (!msg) {
             priv->flushing = false;
-            return LDB_ERR_OPERATIONS_ERROR;
+            ret = LDB_ERR_OPERATIONS_ERROR; goto done;
         }
         msg->dn = user_dn;
 
@@ -5078,7 +5094,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
         el->values = talloc_array(el, struct ldb_val, grp_count);
         if (!el->values) {
             priv->flushing = false;
-            return LDB_ERR_OPERATIONS_ERROR;
+            ret = LDB_ERR_OPERATIONS_ERROR; goto done;
         }
 
         el->num_values = 0;
@@ -5143,7 +5159,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
             msg = ldb_msg_new(priv);
             if (!msg) {
                 priv->flushing = false;
-                return LDB_ERR_OPERATIONS_ERROR;
+                ret = LDB_ERR_OPERATIONS_ERROR; goto done;
             }
             msg->dn = gdn;
 
@@ -5157,7 +5173,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
             el->values = talloc_array(el, struct ldb_val, uid_count);
             if (!el->values) {
                 priv->flushing = false;
-                return LDB_ERR_OPERATIONS_ERROR;
+                ret = LDB_ERR_OPERATIONS_ERROR; goto done;
             }
             el->num_values = uid_count;
 
@@ -5179,19 +5195,13 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
         }
     }
 
+    ret = LDB_SUCCESS;
+
+done:
     priv->flushing = false;
-    talloc_free(user_map);
-    talloc_free(group_memberuids);
-
-    /* Free all pending ops */
-    while (priv->pending_ops) {
-        struct mbof_pending_op *pop = priv->pending_ops;
-        DLIST_REMOVE(priv->pending_ops, pop);
-        talloc_free(pop);
-    }
-    priv->pending_count = 0;
-
-    return LDB_SUCCESS;
+    talloc_free(tmp_ctx);
+    mbof_free_pending_ops(priv);
+    return ret;
 }
 
 static int memberof_prepare_commit(struct ldb_module *module)
@@ -5215,6 +5225,8 @@ static int memberof_end_transaction(struct ldb_module *module)
 
 static int memberof_del_transaction(struct ldb_module *module)
 {
+    struct mbof_private *priv = ldb_module_get_private(module);
+    mbof_free_pending_ops(priv);
     return ldb_next_del_trans(module);
 }
 
