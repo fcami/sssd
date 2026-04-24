@@ -3536,11 +3536,13 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
     }
 
     /* Check if this operation should be deferred for batch processing.
-     * Only defer additions-only changes (no removals, no ghosts) above
-     * threshold. Removals require transitive closure verification that
-     * the batch path does not implement — they fall through to the
-     * existing per-member path which handles them correctly.
-     * Ghost attribute changes also fall through.
+     * Only defer when ALL of:
+     *   - additions only (no removals — need transitive closure)
+     *   - no ghost changes
+     *   - above threshold
+     *   - all added members are users (no nested groups — the batch
+     *     path does not handle transitive memberOf propagation to
+     *     nested group members)
      */
     total = 0;
     if (mod_ctx->mb_add) total += mod_ctx->mb_add->num;
@@ -3550,6 +3552,22 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
         && total > priv->batch_threshold
         && (mod_ctx->mb_remove == NULL || mod_ctx->mb_remove->num == 0)
         && mod_ctx->ghel == NULL) {
+        bool has_nested_groups = false;
+        int k;
+
+        for (k = 0; k < mod_ctx->mb_add->num; k++) {
+            const struct ldb_val *container;
+            container = ldb_dn_get_component_val(mod_ctx->mb_add->dns[k], 1);
+            if (container && container->length == 6
+                && strncasecmp((const char *)container->data, "groups", 6) == 0) {
+                has_nested_groups = true;
+                break;
+            }
+        }
+
+        if (has_nested_groups) {
+            goto per_member_path;
+        }
         struct mbof_pending_op *pop;
 
         pop = talloc_zero(priv, struct mbof_pending_op);
@@ -3572,6 +3590,7 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
         return LDB_SUCCESS;
     }
 
+per_member_path:
     ret = mbof_mod_process_ghel(mod_ctx, mod_ctx->entry, mod_ctx->ghel,
                                 mod_ctx->igh ? mod_ctx->igh->el : NULL,
                                 &mod_ctx->gh_add, &mod_ctx->gh_remove);
@@ -4990,9 +5009,12 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
             continue;
         }
 
-        /* Collect username for memberuid */
-        const char *username = ldb_msg_find_attr_as_string(
-            res->msgs[0], DB_NAME, NULL);
+        /* Collect username for memberuid — only for user entries */
+        const char *username = NULL;
+        if (entry_is_user_object(res->msgs[0]) == LDB_SUCCESS) {
+            username = ldb_msg_find_attr_as_string(
+                res->msgs[0], DB_NAME, NULL);
+        }
         if (username) {
             hret = hash_entries(grp_set, &grp_count, &grp_entries);
             if (hret == HASH_SUCCESS) {
