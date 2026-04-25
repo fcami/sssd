@@ -8510,7 +8510,6 @@ START_TEST (test_sysdb_store_group_members_with_ghosts)
 
     attrs = sysdb_new_attrs(test_ctx);
     sss_ck_fail_if_msg(attrs == NULL, "OOM");
-
     username = test_asprintf_fqname(attrs, test_ctx->domain,
                                     "testuser%d", GHOST_TEST_GID + 1);
     sss_ck_fail_if_msg(username == NULL, "OOM");
@@ -8518,40 +8517,224 @@ START_TEST (test_sysdb_store_group_members_with_ghosts)
     sss_ck_fail_if_msg(member == NULL, "OOM");
     ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
     sss_ck_fail_if_msg(ret != EOK, "Could not add member");
-
     ret = sysdb_attrs_add_string(attrs, SYSDB_GHOST, "ghostuser@FILES");
     sss_ck_fail_if_msg(ret != EOK, "Could not add ghost");
 
     ret = sysdb_store_group_members(test_ctx->domain,
-                                    data->groupname, attrs,
-                                    GHOST_TEST_GID);
-    sss_ck_fail_if_msg(ret != EOK, "store with ghosts failed: %d", ret);
+                                    data->groupname, attrs, GHOST_TEST_GID);
+    sss_ck_fail_if_msg(ret != EOK, "store with ghosts failed");
 
     ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
                                     GHOST_TEST_GID, all_attrs, &msg);
     sss_ck_fail_if_msg(ret != EOK, "Could not find group");
-
     el = ldb_msg_find_element(msg, SYSDB_GHOST);
-    ck_assert_msg(el != NULL, "ghost not set on group");
-    ck_assert_msg(el->num_values == 1,
-                  "Expected 1 ghost, got %d", el->num_values);
+    ck_assert_msg(el != NULL, "ghost not set");
+    ck_assert_msg(el->num_values == 1, "Expected 1 ghost, got %d", el->num_values);
 
     ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
                                    GHOST_TEST_GID + 1, all_attrs, &msg);
     sss_ck_fail_if_msg(ret != EOK, "Could not find user");
-
     el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
-    ck_assert_msg(el != NULL, "memberOf not set on real user");
+    ck_assert_msg(el != NULL, "memberOf not set");
 
     ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
                                     GHOST_TEST_GID, all_attrs, &msg);
     sss_ck_fail_if_msg(ret != EOK, "Could not find group");
-
     el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
     ck_assert_msg(el != NULL, "memberuid not set");
-    ck_assert_msg(el->num_values == 1,
-                  "Expected 1 memberuid (real user only), got %d",
-                  el->num_values);
+    ck_assert_msg(el->num_values == 1, "Expected 1 memberuid, got %d", el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
+/* === Large-scale equivalence test === */
+
+#define LARGE_EQUIV_USER_BASE 170000
+#define LARGE_EQUIV_GID_BASE  175000
+#define LARGE_EQUIV_NUM_MEMBERS 10000
+#define LARGE_EQUIV_NUM_GROUPS 3
+
+START_TEST (test_sysdb_store_group_members_large_equiv)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg_mod;
+    struct ldb_message *msg_sys;
+    const struct ldb_message_element *el_mod;
+    const struct ldb_message_element *el_sys;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    char *groupname;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int spot_indices[] = { 0,
+                           LARGE_EQUIV_NUM_MEMBERS / 2,
+                           LARGE_EQUIV_NUM_MEMBERS - 1 };
+    int ret;
+    int i;
+    int g;
+    int s;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    for (i = 0; i < LARGE_EQUIV_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  LARGE_EQUIV_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+
+    /* Path A: store via memberof module */
+    perf_snap_take(&snap_before);
+    for (g = 0; g < LARGE_EQUIV_NUM_GROUPS; g++) {
+        data = test_data_new_group(test_ctx,
+                                   LARGE_EQUIV_GID_BASE + g);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+
+        for (i = 0; i < LARGE_EQUIV_NUM_MEMBERS; i++) {
+            username = test_asprintf_fqname(data, test_ctx->domain,
+                                            "testuser%d",
+                                            LARGE_EQUIV_USER_BASE + i);
+            sss_ck_fail_if_msg(username == NULL, "OOM");
+            member = sysdb_user_strdn(data,
+                                      test_ctx->domain->name,
+                                      username);
+            sss_ck_fail_if_msg(member == NULL, "OOM");
+            ret = sysdb_attrs_steal_string(data->attrs,
+                                           SYSDB_MEMBER, member);
+            sss_ck_fail_if_msg(ret != EOK,
+                               "add member %d to group %d", i, g);
+        }
+        ret = test_store_group(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Module path: store group %d failed", g);
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("large_equiv: module path (3 groups)",
+                     &snap_before, &snap_after);
+
+    /* Snapshot sampled users via module path */
+    struct ldb_message *mod_snapshots[3];
+    for (s = 0; s < 3; s++) {
+        ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                       LARGE_EQUIV_USER_BASE
+                                           + spot_indices[s],
+                                       all_attrs, &mod_snapshots[s]);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Module: could not find user %d",
+                           spot_indices[s]);
+    }
+
+    /* Delete groups */
+    for (g = 0; g < LARGE_EQUIV_NUM_GROUPS; g++) {
+        ret = sysdb_delete_group(test_ctx->domain, NULL,
+                                 LARGE_EQUIV_GID_BASE + g);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not delete group %d", g);
+    }
+
+    /* Path B: store via sysdb bypass */
+    perf_snap_take(&snap_before);
+    for (g = 0; g < LARGE_EQUIV_NUM_GROUPS; g++) {
+        data = test_data_new_group(test_ctx,
+                                   LARGE_EQUIV_GID_BASE + g);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_group(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not re-store empty group %d", g);
+
+        attrs = sysdb_new_attrs(test_ctx);
+        sss_ck_fail_if_msg(attrs == NULL, "OOM");
+
+        for (i = 0; i < LARGE_EQUIV_NUM_MEMBERS; i++) {
+            username = test_asprintf_fqname(attrs, test_ctx->domain,
+                                            "testuser%d",
+                                            LARGE_EQUIV_USER_BASE + i);
+            sss_ck_fail_if_msg(username == NULL, "OOM");
+            member = sysdb_user_strdn(attrs,
+                                      test_ctx->domain->name,
+                                      username);
+            sss_ck_fail_if_msg(member == NULL, "OOM");
+            ret = sysdb_attrs_steal_string(attrs,
+                                           SYSDB_MEMBER, member);
+            sss_ck_fail_if_msg(ret != EOK,
+                               "add member %d to group %d", i, g);
+        }
+
+        groupname = test_asprintf_fqname(test_ctx, test_ctx->domain,
+                                         "testgroup%d",
+                                         LARGE_EQUIV_GID_BASE + g);
+        sss_ck_fail_if_msg(groupname == NULL, "OOM");
+
+        ret = sysdb_store_group_members(test_ctx->domain,
+                                        groupname, attrs,
+                                        LARGE_EQUIV_GID_BASE + g);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Sysdb path: store group %d failed", g);
+        talloc_free(attrs);
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("large_equiv: sysdb path (3 groups)",
+                     &snap_before, &snap_after);
+
+    /* Compare sampled users */
+    for (s = 0; s < 3; s++) {
+        ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                       LARGE_EQUIV_USER_BASE
+                                           + spot_indices[s],
+                                       all_attrs, &msg_sys);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Sysdb: could not find user %d",
+                           spot_indices[s]);
+
+        el_mod = ldb_msg_find_element(mod_snapshots[s], SYSDB_MEMBEROF);
+        el_sys = ldb_msg_find_element(msg_sys, SYSDB_MEMBEROF);
+
+        ck_assert_msg(el_mod != NULL,
+                      "Module: no memberOf on user %d",
+                      spot_indices[s]);
+        ck_assert_msg(el_sys != NULL,
+                      "Sysdb: no memberOf on user %d",
+                      spot_indices[s]);
+        ck_assert_msg(el_mod->num_values == el_sys->num_values,
+                      "User %d: memberOf count mismatch: "
+                      "module=%d sysdb=%d",
+                      spot_indices[s],
+                      el_mod->num_values, el_sys->num_values);
+
+        for (i = 0; i < (int)el_mod->num_values; i++) {
+            ck_assert_msg(
+                ldb_msg_find_val(el_sys, &el_mod->values[i]) != NULL,
+                "User %d: memberOf value mismatch at %d: '%.*s'",
+                spot_indices[s], i,
+                (int)el_mod->values[i].length,
+                (char *)el_mod->values[i].data);
+        }
+    }
+
+    /* Compare memberuid on each group */
+    for (g = 0; g < LARGE_EQUIV_NUM_GROUPS; g++) {
+        ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                        LARGE_EQUIV_GID_BASE + g,
+                                        all_attrs, &msg_sys);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not find group %d", g);
+
+        el_sys = ldb_msg_find_element(msg_sys, SYSDB_MEMBERUID);
+        ck_assert_msg(el_sys != NULL,
+                      "No memberuid on group %d", g);
+        ck_assert_msg(el_sys->num_values == LARGE_EQUIV_NUM_MEMBERS,
+                      "Group %d: memberuid count %d != %d",
+                      g, el_sys->num_values,
+                      LARGE_EQUIV_NUM_MEMBERS);
+    }
 
     talloc_free(test_ctx);
 }
@@ -9396,6 +9579,7 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_idempotent);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_with_ghosts);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_memberof_nested_group_fallback);
+    tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_large_equiv);
     suite_add_tcase(s, tc_sysdb_path_verify);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
