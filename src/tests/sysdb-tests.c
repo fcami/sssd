@@ -8869,6 +8869,118 @@ START_TEST (test_sysdb_store_group_members_idempotent)
 }
 END_TEST
 
+#define NESTED_GRP_USER_BASE 150000
+#define NESTED_GRP_OUTER_GID 155000
+#define NESTED_GRP_INNER_GID 155001
+#define NESTED_GRP_NUM_USERS 100
+
+START_TEST (test_sysdb_memberof_nested_group_fallback)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    int ret;
+    int i;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    for (i = 0; i < NESTED_GRP_NUM_USERS; i++) {
+        data = test_data_new_user(test_ctx, NESTED_GRP_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK, "Could not store user %d", i);
+    }
+
+    /* Create inner group with all users as members */
+    data = test_data_new_group(test_ctx, NESTED_GRP_INNER_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    for (i = 0; i < NESTED_GRP_NUM_USERS; i++) {
+        username = test_asprintf_fqname(data, test_ctx->domain,
+                                        "testuser%d",
+                                        NESTED_GRP_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(data, test_ctx->domain->name, username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(data->attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add member %d", i);
+    }
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store inner group");
+
+    /* Create outer group containing the inner group as member.
+     * This has >50 members (100 users + 1 group = 101) but the
+     * group member DN should force fallback to the per-member path.
+     */
+    data = test_data_new_group(test_ctx, NESTED_GRP_OUTER_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+
+    for (i = 0; i < NESTED_GRP_NUM_USERS; i++) {
+        username = test_asprintf_fqname(data, test_ctx->domain,
+                                        "testuser%d",
+                                        NESTED_GRP_USER_BASE + i);
+        sss_ck_fail_if_msg(username == NULL, "OOM");
+        member = sysdb_user_strdn(data, test_ctx->domain->name, username);
+        sss_ck_fail_if_msg(member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(data->attrs, SYSDB_MEMBER, member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add user member %d", i);
+    }
+
+    /* Add the inner group as a member */
+    {
+        char *inner_name;
+        char *inner_member;
+        inner_name = test_asprintf_fqname(data, test_ctx->domain,
+                                          "testgroup%d",
+                                          NESTED_GRP_INNER_GID);
+        sss_ck_fail_if_msg(inner_name == NULL, "OOM");
+        inner_member = sysdb_group_strdn(data, test_ctx->domain->name,
+                                         inner_name);
+        sss_ck_fail_if_msg(inner_member == NULL, "OOM");
+        ret = sysdb_attrs_steal_string(data->attrs, SYSDB_MEMBER,
+                                       inner_member);
+        sss_ck_fail_if_msg(ret != EOK, "Failed to add group member");
+    }
+
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store outer group");
+
+    /* Verify: user 0 should have memberOf for BOTH groups
+     * (inner directly, outer via the per-member path that handles
+     * nested group propagation).
+     */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   NESTED_GRP_USER_BASE, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "No memberOf on user 0");
+    ck_assert_msg(el->num_values == 2,
+                  "Expected 2 memberOf (inner+outer), got %d",
+                  el->num_values);
+
+    /* Verify: outer group should NOT have inner group name in memberuid
+     * (memberuid is for users only).
+     */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    NESTED_GRP_OUTER_GID, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find outer group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "No memberuid on outer group");
+    ck_assert_msg(el->num_values == NESTED_GRP_NUM_USERS,
+                  "Expected %d memberuid (users only), got %d",
+                  NESTED_GRP_NUM_USERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 Suite *create_sysdb_suite(void)
 {
     Suite *s = suite_create("sysdb");
@@ -9283,6 +9395,7 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_edge_cases);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_idempotent);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_with_ghosts);
+    tcase_add_test(tc_sysdb_path_verify, test_sysdb_memberof_nested_group_fallback);
     suite_add_tcase(s, tc_sysdb_path_verify);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
