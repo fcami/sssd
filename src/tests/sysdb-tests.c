@@ -8479,6 +8479,84 @@ void ipnetwork_check_match_addr(struct sysdb_test_ctx *test_ctx,
 			  address);
 }
 
+/* === Ghost handling test === */
+
+#define GHOST_TEST_GID 180000
+
+START_TEST (test_sysdb_store_group_members_with_ghosts)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_attrs *attrs;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    int ret;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    data = test_data_new_user(test_ctx, GHOST_TEST_GID + 1);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_user(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store user");
+
+    data = test_data_new_group(test_ctx, GHOST_TEST_GID);
+    sss_ck_fail_if_msg(data == NULL, "OOM");
+    ret = test_store_group(data);
+    sss_ck_fail_if_msg(ret != EOK, "Could not store group");
+
+    attrs = sysdb_new_attrs(test_ctx);
+    sss_ck_fail_if_msg(attrs == NULL, "OOM");
+
+    username = test_asprintf_fqname(attrs, test_ctx->domain,
+                                    "testuser%d", GHOST_TEST_GID + 1);
+    sss_ck_fail_if_msg(username == NULL, "OOM");
+    member = sysdb_user_strdn(attrs, test_ctx->domain->name, username);
+    sss_ck_fail_if_msg(member == NULL, "OOM");
+    ret = sysdb_attrs_steal_string(attrs, SYSDB_MEMBER, member);
+    sss_ck_fail_if_msg(ret != EOK, "Could not add member");
+
+    ret = sysdb_attrs_add_string(attrs, SYSDB_GHOST, "ghostuser@FILES");
+    sss_ck_fail_if_msg(ret != EOK, "Could not add ghost");
+
+    ret = sysdb_store_group_members(test_ctx->domain,
+                                    data->groupname, attrs,
+                                    GHOST_TEST_GID);
+    sss_ck_fail_if_msg(ret != EOK, "store with ghosts failed: %d", ret);
+
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    GHOST_TEST_GID, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find group");
+
+    el = ldb_msg_find_element(msg, SYSDB_GHOST);
+    ck_assert_msg(el != NULL, "ghost not set on group");
+    ck_assert_msg(el->num_values == 1,
+                  "Expected 1 ghost, got %d", el->num_values);
+
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   GHOST_TEST_GID + 1, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on real user");
+
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    GHOST_TEST_GID, all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "memberuid not set");
+    ck_assert_msg(el->num_values == 1,
+                  "Expected 1 memberuid (real user only), got %d",
+                  el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST(test_sysdb_add_ipnetworks)
 {
     errno_t ret;
@@ -9204,6 +9282,7 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_equivalence);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_edge_cases);
     tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_idempotent);
+    tcase_add_test(tc_sysdb_path_verify, test_sysdb_store_group_members_with_ghosts);
     suite_add_tcase(s, tc_sysdb_path_verify);
 
     TCase *tc_subdomain = tcase_create("SYSDB sub-domain Tests");
