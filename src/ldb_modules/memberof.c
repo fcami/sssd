@@ -4905,6 +4905,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
     TALLOC_CTX *tmp_ctx;
     struct mbof_pending_op *pop;
     hash_table_t *user_map;
+    hash_table_t *user_dn_map;
     hash_table_t *group_memberuids;
     hash_key_t hkey;
     hash_value_t hval;
@@ -4923,6 +4924,12 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
                          hash_alloc, hash_free, tmp_ctx, NULL, NULL);
     if (ret != HASH_SUCCESS) {
         talloc_free(tmp_ctx);
+        ret = LDB_ERR_OPERATIONS_ERROR; goto done;
+    }
+
+    ret = hash_create_ex(4096, &user_dn_map, 0, 0, 0, 0,
+                         hash_alloc, hash_free, tmp_ctx, NULL, NULL);
+    if (ret != HASH_SUCCESS) {
         ret = LDB_ERR_OPERATIONS_ERROR; goto done;
     }
 
@@ -4968,6 +4975,10 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
                     hval.type = HASH_VALUE_PTR;
                     hval.ptr = grp_set;
                     hash_enter(user_map, &hkey, &hval);
+
+                    hval.type = HASH_VALUE_PTR;
+                    hval.ptr = pop->added->dns[i];
+                    hash_enter(user_dn_map, &hkey, &hval);
                 }
 
                 hkey.type = HASH_KEY_STRING;
@@ -5011,11 +5022,13 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
             continue;
         }
 
-        user_dn = ldb_dn_new(priv, ldb, user_cf);
-        if (!user_dn) {
-            priv->flushing = false;
+        hkey.type = HASH_KEY_STRING;
+        hkey.str = discard_const(user_cf);
+        hret = hash_lookup(user_dn_map, &hkey, &hval);
+        if (hret != HASH_SUCCESS) {
             ret = LDB_ERR_OPERATIONS_ERROR; goto done;
         }
+        user_dn = (struct ldb_dn *)hval.ptr;
 
         /* Read current entry to get existing memberOf and name */
         ret = ldb_search(ldb, priv, &res, user_dn, LDB_SCOPE_BASE,
