@@ -798,10 +798,10 @@ static int sdap_save_group(TALLOC_CTX *memctx,
             ret = sysdb_store_group_members(dom, group_name,
                                             member_attrs, gid);
             if (ret != EOK) {
-                DEBUG(SSSDBG_MINOR_FAILURE,
-                      "Bypass path failed for group [%s]: [%s], "
-                      "data will be corrected on next refresh\n",
+                DEBUG(SSSDBG_OP_FAILURE,
+                      "Bypass path failed for group [%s]: [%s]\n",
                       group_name, sss_strerror(ret));
+                goto done;
             }
         }
     }
