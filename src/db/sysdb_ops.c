@@ -2487,6 +2487,17 @@ static int sysdb_memberof_bypass_mod(struct sss_domain_info *domain,
     return sysdb_error_to_errno(ret);
 }
 
+/*
+ * Bypass path for memberOf: computes memberOf/memberuid directly
+ * instead of going through the memberof LDB module.  Limitations:
+ * no nested groups, no transitive closure, no ghost propagation.
+ *
+ * There are three implementations of the memberOf invariant:
+ *   1. The memberof LDB module (src/ldb_modules/memberof.c)
+ *   2. This function — single-group bypass
+ *   3. mbof_flush_pending_ops() in memberof.c — batched deferred flush
+ * Changes to memberOf semantics must be validated against all three.
+ */
 int sysdb_store_group_members(struct sss_domain_info *domain,
                               const char *group_name,
                               struct sysdb_attrs *group_attrs,
