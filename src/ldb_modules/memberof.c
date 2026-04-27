@@ -5100,8 +5100,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
 
         ret = ldb_msg_add_empty(msg, DB_MEMBEROF, LDB_FLAG_MOD_ADD, &el);
         if (ret != LDB_SUCCESS) {
-            priv->flushing = false;
-            return ret;
+            goto done;
         }
 
         el->values = talloc_array(el, struct ldb_val, grp_count);
@@ -5179,8 +5178,7 @@ static int mbof_flush_pending_ops(struct ldb_module *module,
             ret = ldb_msg_add_empty(msg, DB_MEMBERUID,
                                     LDB_FLAG_MOD_ADD, &el);
             if (ret != LDB_SUCCESS) {
-                priv->flushing = false;
-                return ret;
+                goto done;
             }
 
             el->values = talloc_array(el, struct ldb_val, uid_count);
