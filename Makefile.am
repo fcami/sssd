@@ -356,6 +356,7 @@ non_interactive_cmocka_based_tests += \
     ad_gpo_tests \
     ad_common_tests \
     test_sdap_initgr \
+    test_sdap_save_group \
     test_ad_subdom \
     test_ipa_subdom_server \
     $(NULL)
@@ -3521,6 +3522,30 @@ test_sdap_initgr_CFLAGS = \
     $(NDR_NBT_CFLAGS) \
     $(NULL)
 test_sdap_initgr_LDADD = \
+    $(CMOCKA_LIBS) \
+    $(POPT_LIBS) \
+    $(DHASH_LIBS) \
+    $(TALLOC_LIBS) \
+    $(TEVENT_LIBS) \
+    $(LDB_LIBS) \
+    $(SSSD_INTERNAL_LTLIBS) \
+    libsss_ldap_common.la \
+    libsss_test_common.la \
+    libdlopen_test_providers.la \
+    libsss_iface.la \
+    libsss_sbus.la \
+    $(NULL)
+
+test_sdap_save_group_SOURCES = \
+    src/tests/cmocka/common_mock_sdap.c \
+    src/tests/cmocka/test_sdap_save_group.c \
+    $(NULL)
+test_sdap_save_group_CFLAGS = \
+    $(AM_CFLAGS) \
+    $(CMOCKA_CFLAGS) \
+    $(NDR_NBT_CFLAGS) \
+    $(NULL)
+test_sdap_save_group_LDADD = \
     $(CMOCKA_LIBS) \
     $(POPT_LIBS) \
     $(DHASH_LIBS) \
