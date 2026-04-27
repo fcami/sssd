@@ -63,7 +63,7 @@ struct mbof_pending_op {
  *
  * SSSD_MEMBEROF_BATCH=0            disables batching (default: enabled)
  * SSSD_MEMBEROF_BATCH_THRESHOLD=N  per-group member threshold (default: 50)
- * SSSD_MEMBEROF_BATCH_SIZE=K       flush every K groups (default: 12)
+ * SSSD_MEMBEROF_BATCH_SIZE=K       flush every K groups (default: 4)
  *
  * Could be exposed in sssd.conf should the need arise.
  */
