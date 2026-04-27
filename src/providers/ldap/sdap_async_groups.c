@@ -710,13 +710,102 @@ static int sdap_save_group(TALLOC_CTX *memctx,
     }
     DEBUG(SSSDBG_TRACE_FUNC, "Storing info for group %s\n", group_name);
 
-    ret = sysdb_store_group(dom, group_name, gid, group_attrs,
-                            dom->group_timeout, now);
-    if (ret) {
-        DEBUG(SSSDBG_MINOR_FAILURE,
-              "Could not store group [%s] with GID [%u]: [%s]\n",
-              group_name, gid, sss_strerror(ret));
-        goto done;
+    /* For groups above the bypass threshold, use the sysdb bypass path
+     * for member/ghost attrs. Strip them from group_attrs before
+     * sysdb_store_group so the memberof module doesn't process them,
+     * then handle them via sysdb_store_group_members which bypasses
+     * the module.
+     *
+     * SSSD_SDAP_BYPASS_THRESHOLD overrides the default (50).
+     * Set to 0 to bypass for all groups (useful for testing).
+     * Set to -1 to disable bypass entirely.
+     */
+    {
+        struct sysdb_attrs *member_attrs = NULL;
+        struct ldb_message_element *member_el = NULL;
+        struct ldb_message_element *ghost_el_save = NULL;
+        bool use_bypass = false;
+        static bool threshold_cached = false;
+        static int bypass_threshold = 50;
+        int mi;
+
+        if (!threshold_cached) {
+            const char *env = getenv("SSSD_SDAP_BYPASS_THRESHOLD");
+            if (env) {
+                char *endptr;
+                long val = strtol(env, &endptr, 10);
+                if (*endptr == '\0') {
+                    bypass_threshold = (int)val;
+                }
+            }
+            threshold_cached = true;
+        }
+
+        for (mi = 0; mi < group_attrs->num; mi++) {
+            if (strcasecmp(group_attrs->a[mi].name, SYSDB_MEMBER) == 0) {
+                member_el = &group_attrs->a[mi];
+            }
+        }
+
+        if (member_el && bypass_threshold >= 0
+            && (int)member_el->num_values > bypass_threshold) {
+            use_bypass = true;
+
+            member_attrs = sysdb_new_attrs(tmpctx);
+            if (member_attrs == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+
+            /* Move member element to member_attrs */
+            member_attrs->a = talloc_realloc(member_attrs,
+                                             member_attrs->a,
+                                             struct ldb_message_element,
+                                             2);
+            if (member_attrs->a == NULL) {
+                ret = ENOMEM;
+                goto done;
+            }
+            member_attrs->a[0] = *member_el;
+            member_attrs->num = 1;
+
+            /* Also move ghost if present */
+            for (mi = 0; mi < group_attrs->num; mi++) {
+                if (strcasecmp(group_attrs->a[mi].name,
+                               SYSDB_GHOST) == 0) {
+                    ghost_el_save = &group_attrs->a[mi];
+                    break;
+                }
+            }
+            if (ghost_el_save && ghost_el_save->num_values > 0) {
+                member_attrs->a[1] = *ghost_el_save;
+                member_attrs->num = 2;
+                ghost_el_save->num_values = 0;
+            }
+
+            /* Clear member from group_attrs so memberof doesn't fire */
+            member_el->num_values = 0;
+        }
+
+        ret = sysdb_store_group(dom, group_name, gid, group_attrs,
+                                dom->group_timeout, now);
+        if (ret) {
+            DEBUG(SSSDBG_MINOR_FAILURE,
+                  "Could not store group [%s] with GID [%u]: [%s]\n",
+                  group_name, gid, sss_strerror(ret));
+            goto done;
+        }
+
+        if (use_bypass && member_attrs) {
+            ret = sysdb_store_group_members(dom, group_name,
+                                            member_attrs, gid);
+            if (ret != EOK) {
+                DEBUG(SSSDBG_OP_FAILURE,
+                      "Bypass path failed for group [%s]: [%s]\n",
+                      group_name, sss_strerror(ret));
+                goto done;
+            }
+        }
     }
 
     if (_usn_value) {
