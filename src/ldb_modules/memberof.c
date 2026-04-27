@@ -3523,6 +3523,7 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
     struct ldb_context *ldb;
     struct mbof_ctx *ctx;
     struct mbof_private *priv;
+    struct mbof_pending_op *pop;
     int total;
     int ret;
 
@@ -3568,7 +3569,6 @@ static int mbof_mod_process(struct mbof_mod_ctx *mod_ctx, bool *done)
         if (has_nested_groups) {
             goto per_member_path;
         }
-        struct mbof_pending_op *pop;
 
         pop = talloc_zero(priv, struct mbof_pending_op);
         if (!pop) {
