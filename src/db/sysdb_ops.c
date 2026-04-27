@@ -2514,10 +2514,12 @@ int sysdb_store_group_members(struct sss_domain_info *domain,
     }
 
     new_members_el = NULL;
+    const struct ldb_message_element *ghost_el = NULL;
     for (i = 0; i < group_attrs->num; i++) {
         if (strcasecmp(group_attrs->a[i].name, SYSDB_MEMBER) == 0) {
             new_members_el = &group_attrs->a[i];
-            break;
+        } else if (strcasecmp(group_attrs->a[i].name, SYSDB_GHOST) == 0) {
+            ghost_el = &group_attrs->a[i];
         }
     }
     if (new_members_el == NULL || new_members_el->num_values == 0) {
@@ -2601,6 +2603,30 @@ int sysdb_store_group_members(struct sss_domain_info *domain,
     ret = sysdb_memberof_bypass_mod(domain, msg);
     if (ret != EOK) {
         goto done;
+    }
+
+    /* Write ghost attribute if present */
+    if (ghost_el && ghost_el->num_values > 0) {
+        msg = ldb_msg_new(tmp_ctx);
+        if (msg == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        msg->dn = group_dn;
+
+        ret = ldb_msg_add_empty(msg, SYSDB_GHOST,
+                                LDB_FLAG_MOD_REPLACE, &el);
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done;
+        }
+        el->values = ghost_el->values;
+        el->num_values = ghost_el->num_values;
+
+        ret = sysdb_memberof_bypass_mod(domain, msg);
+        if (ret != EOK) {
+            goto done;
+        }
     }
 
     /* For each new member not in the old set: add memberOf */
