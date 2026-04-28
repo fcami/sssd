@@ -8564,6 +8564,125 @@ START_TEST (test_sysdb_store_group_members_large)
 }
 END_TEST
 
+#define SYSDB_BATCH_USER_BASE 120000
+#define SYSDB_BATCH_GID_BASE  130000
+#define SYSDB_BATCH_NUM_MEMBERS 10000
+#define SYSDB_BATCH_NUM_GROUPS 12
+
+START_TEST (test_sysdb_store_groups_members_batch)
+{
+    struct sysdb_test_ctx *test_ctx;
+    struct test_data *data;
+    struct sysdb_group_member_op *ops;
+    struct ldb_message *msg;
+    const struct ldb_message_element *el;
+    const char *all_attrs[] = { "*", NULL };
+    char *username;
+    char *member;
+    struct perf_snap snap_before;
+    struct perf_snap snap_after;
+    int ret;
+    int i;
+    int g;
+
+    ret = setup_sysdb_tests(&test_ctx);
+    sss_ck_fail_if_msg(ret != EOK, "Could not set up the test");
+
+    /* Create users */
+    perf_snap_take(&snap_before);
+    for (i = 0; i < SYSDB_BATCH_NUM_MEMBERS; i++) {
+        data = test_data_new_user(test_ctx,
+                                  SYSDB_BATCH_USER_BASE + i);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_user(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store user %d", i);
+    }
+    perf_snap_take(&snap_after);
+    perf_snap_report("sysdb_batch: create users",
+                     &snap_before, &snap_after);
+
+    /* Create empty groups */
+    for (g = 0; g < SYSDB_BATCH_NUM_GROUPS; g++) {
+        data = test_data_new_group(test_ctx,
+                                   SYSDB_BATCH_GID_BASE + g);
+        sss_ck_fail_if_msg(data == NULL, "OOM");
+        ret = test_store_group(data);
+        sss_ck_fail_if_msg(ret != EOK,
+                           "Could not store group %d", g);
+    }
+
+    /* Build batch ops */
+    ops = talloc_array(test_ctx, struct sysdb_group_member_op,
+                       SYSDB_BATCH_NUM_GROUPS);
+    sss_ck_fail_if_msg(ops == NULL, "OOM");
+
+    for (g = 0; g < SYSDB_BATCH_NUM_GROUPS; g++) {
+        ops[g].gid = SYSDB_BATCH_GID_BASE + g;
+        ops[g].group_name = test_asprintf_fqname(
+            test_ctx, test_ctx->domain,
+            "testgroup%d", SYSDB_BATCH_GID_BASE + g);
+        sss_ck_fail_if_msg(ops[g].group_name == NULL, "OOM");
+
+        ops[g].attrs = sysdb_new_attrs(test_ctx);
+        sss_ck_fail_if_msg(ops[g].attrs == NULL, "OOM");
+
+        for (i = 0; i < SYSDB_BATCH_NUM_MEMBERS; i++) {
+            username = test_asprintf_fqname(
+                ops[g].attrs, test_ctx->domain,
+                "testuser%d", SYSDB_BATCH_USER_BASE + i);
+            sss_ck_fail_if_msg(username == NULL, "OOM");
+            member = sysdb_user_strdn(ops[g].attrs,
+                                      test_ctx->domain->name,
+                                      username);
+            sss_ck_fail_if_msg(member == NULL, "OOM");
+            ret = sysdb_attrs_steal_string(ops[g].attrs,
+                                           SYSDB_MEMBER, member);
+            sss_ck_fail_if_msg(ret != EOK,
+                               "Failed to add member %d to op %d",
+                               i, g);
+        }
+    }
+
+    /* Store all groups via the batch path */
+    perf_snap_take(&snap_before);
+    ret = sysdb_store_groups_members(test_ctx->domain, ops,
+                                     SYSDB_BATCH_NUM_GROUPS);
+    perf_snap_take(&snap_after);
+    sss_ck_fail_if_msg(ret != EOK,
+                       "sysdb_store_groups_members failed");
+    perf_snap_report("sysdb_batch: store all groups",
+                     &snap_before, &snap_after);
+
+    /* Verify user 0 has all groups in memberOf */
+    ret = sysdb_search_user_by_uid(test_ctx, test_ctx->domain,
+                                   SYSDB_BATCH_USER_BASE,
+                                   all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find user 0");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBEROF);
+    ck_assert_msg(el != NULL, "memberOf not set on user 0");
+    ck_assert_msg(el->num_values == SYSDB_BATCH_NUM_GROUPS,
+                  "Expected %d memberOf on user 0, got %d",
+                  SYSDB_BATCH_NUM_GROUPS, el->num_values);
+
+    /* Verify last group has correct memberuid count */
+    ret = sysdb_search_group_by_gid(test_ctx, test_ctx->domain,
+                                    SYSDB_BATCH_GID_BASE
+                                        + SYSDB_BATCH_NUM_GROUPS - 1,
+                                    all_attrs, &msg);
+    sss_ck_fail_if_msg(ret != EOK, "Could not find last group");
+
+    el = ldb_msg_find_element(msg, SYSDB_MEMBERUID);
+    ck_assert_msg(el != NULL, "memberuid not set on last group");
+    ck_assert_msg(el->num_values == SYSDB_BATCH_NUM_MEMBERS,
+                  "Expected %d memberuid, got %d",
+                  SYSDB_BATCH_NUM_MEMBERS, el->num_values);
+
+    talloc_free(test_ctx);
+}
+END_TEST
+
 START_TEST(test_sysdb_add_hosts)
 {
     errno_t ret;
@@ -9830,6 +9949,7 @@ Suite *create_sysdb_suite(void)
     tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_basic);
     tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_removal);
     tcase_add_test(tc_sysdb_path, test_sysdb_store_group_members_large);
+    tcase_add_test(tc_sysdb_path, test_sysdb_store_groups_members_batch);
     suite_add_tcase(s, tc_sysdb_path);
 
     TCase *tc_sysdb_path_verify = tcase_create(

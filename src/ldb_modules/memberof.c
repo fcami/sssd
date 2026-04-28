@@ -4879,17 +4879,6 @@ static int memberof_init(struct ldb_module *module)
     return ldb_next_init(module);
 }
 
-static int memberof_start_transaction(struct ldb_module *module)
-{
-    struct mbof_private *priv = ldb_module_get_private(module);
-    if (priv) {
-        priv->flushing = false;
-        priv->pending_count = 0;
-        priv->pending_ops = NULL;
-    }
-    return ldb_next_start_trans(module);
-}
-
 static void mbof_free_pending_ops(struct mbof_private *priv)
 {
     struct mbof_pending_op *pop, *next;
@@ -4904,6 +4893,27 @@ static void mbof_free_pending_ops(struct mbof_private *priv)
     priv->pending_count = 0;
 }
 
+static int memberof_start_transaction(struct ldb_module *module)
+{
+    struct mbof_private *priv = ldb_module_get_private(module);
+    if (priv) {
+        priv->flushing = false;
+        mbof_free_pending_ops(priv);
+    }
+    return ldb_next_start_trans(module);
+}
+
+/*
+ * Batched deferred flush: accumulates pending additions across
+ * groups and emits memberOf/memberuid in bulk.  Limitations:
+ * additions only, no nested groups, no transitive closure.
+ *
+ * There are three implementations of the memberOf invariant:
+ *   1. The memberof LDB module (this file, ~4000 lines above)
+ *   2. sysdb_store_group_members() in src/db/sysdb_ops.c
+ *   3. This function — batched deferred flush
+ * Changes to memberOf semantics must be validated against all three.
+ */
 static int mbof_flush_pending_ops(struct ldb_module *module,
                                   struct mbof_private *priv)
 {

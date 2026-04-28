@@ -1245,6 +1245,16 @@ int sysdb_store_group_members(struct sss_domain_info *domain,
                               struct sysdb_attrs *group_attrs,
                               gid_t gid);
 
+struct sysdb_group_member_op {
+    const char *group_name;
+    gid_t gid;
+    struct sysdb_attrs *attrs;
+};
+
+int sysdb_store_groups_members(struct sss_domain_info *domain,
+                               struct sysdb_group_member_op *ops,
+                               int num_ops);
+
 int sysdb_add_group_member(struct sss_domain_info *domain,
                            const char *group,
                            const char *member,

@@ -2838,6 +2838,281 @@ done:
     return ret;
 }
 
+struct mbof_user_entry {
+    const char **group_dns;
+    int num_groups;
+    int alloc_groups;
+    const char *username;
+};
+
+int sysdb_store_groups_members(struct sss_domain_info *domain,
+                               struct sysdb_group_member_op *ops,
+                               int num_ops)
+{
+    TALLOC_CTX *tmp_ctx;
+    hash_table_t *user_map = NULL;
+    hash_key_t hkey;
+    hash_value_t hval;
+    hash_entry_t *entries;
+    unsigned long count;
+    struct ldb_dn **group_dns = NULL;
+    struct ldb_message *msg;
+    struct ldb_message_element *el;
+    int ret;
+    int hret;
+    int g;
+    int i;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        return ENOMEM;
+    }
+
+    hret = hash_create(16384, &user_map, NULL, NULL);
+    if (hret != HASH_SUCCESS) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    group_dns = talloc_array(tmp_ctx, struct ldb_dn *, num_ops);
+    if (group_dns == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+    for (g = 0; g < num_ops; g++) {
+        group_dns[g] = sysdb_group_dn(tmp_ctx, domain, ops[g].group_name);
+        if (group_dns[g] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+    }
+
+    /* Phase 1: accumulate user -> group DN list.
+     * No string copies -- store pointers to existing DN strings.
+     * Parse each unique member DN once to extract the username.
+     */
+    for (g = 0; g < num_ops; g++) {
+        const struct ldb_message_element *members_el = NULL;
+        const char *group_dn_str = ldb_dn_get_linearized(group_dns[g]);
+
+        for (i = 0; i < ops[g].attrs->num; i++) {
+            if (strcasecmp(ops[g].attrs->a[i].name, SYSDB_MEMBER) == 0) {
+                members_el = &ops[g].attrs->a[i];
+                break;
+            }
+        }
+        if (members_el == NULL || members_el->num_values == 0) {
+            continue;
+        }
+
+        for (i = 0; i < (int)members_el->num_values; i++) {
+            const char *member_dn_str;
+            struct mbof_user_entry *ue;
+
+            member_dn_str = (const char *)members_el->values[i].data;
+
+            hkey.type = HASH_KEY_STRING;
+            hkey.str = discard_const(member_dn_str);
+            hret = hash_lookup(user_map, &hkey, &hval);
+            if (hret == HASH_SUCCESS) {
+                ue = (struct mbof_user_entry *)hval.ptr;
+            } else {
+                struct ldb_dn *mdn;
+
+                ue = talloc_zero(tmp_ctx, struct mbof_user_entry);
+                if (ue == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                ue->alloc_groups = num_ops;
+                ue->group_dns = talloc_array(ue, const char *,
+                                             ue->alloc_groups);
+                if (ue->group_dns == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+
+                mdn = ldb_dn_new(tmp_ctx, domain->sysdb->ldb,
+                                 member_dn_str);
+                if (mdn && ldb_dn_get_comp_num(mdn) > 0) {
+                    const struct ldb_val *v;
+                    v = ldb_dn_get_component_val(mdn, 0);
+                    if (v && v->data) {
+                        ue->username = (const char *)v->data;
+                    }
+                }
+
+                hval.type = HASH_VALUE_PTR;
+                hval.ptr = ue;
+                hash_enter(user_map, &hkey, &hval);
+            }
+
+            ue->group_dns[ue->num_groups] = group_dn_str;
+            ue->num_groups++;
+        }
+    }
+
+    /* Phase 2: emit one memberOf modify per user.
+     * Chunk transactions to bound LDB transaction state in memory.
+     */
+#define SYSDB_BATCH_CHUNK 250
+    {
+    int modcount = 0;
+
+    hret = hash_entries(user_map, &count, &entries);
+    if (hret != HASH_SUCCESS) {
+        ret = EIO;
+        goto done;
+    }
+
+    ret = sysdb_transaction_start(domain->sysdb);
+    if (ret != EOK) {
+        goto done;
+    }
+
+    for (i = 0; i < (int)count; i++) {
+        struct mbof_user_entry *ue;
+        struct ldb_dn *user_dn;
+        int j;
+
+        ue = (struct mbof_user_entry *)entries[i].value.ptr;
+        if (ue->num_groups == 0) continue;
+
+        user_dn = ldb_dn_new(tmp_ctx, domain->sysdb->ldb,
+                             entries[i].key.str);
+        if (user_dn == NULL) {
+            ret = ENOMEM;
+            goto done_txn;
+        }
+
+        msg = ldb_msg_new(tmp_ctx);
+        if (msg == NULL) {
+            ret = ENOMEM;
+            goto done_txn;
+        }
+        msg->dn = user_dn;
+
+        ret = ldb_msg_add_empty(msg, SYSDB_MEMBEROF,
+                                LDB_FLAG_MOD_ADD, &el);
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done_txn;
+        }
+
+        el->values = talloc_array(el, struct ldb_val, ue->num_groups);
+        if (el->values == NULL) {
+            ret = ENOMEM;
+            goto done_txn;
+        }
+        el->num_values = ue->num_groups;
+        for (j = 0; j < ue->num_groups; j++) {
+            el->values[j].data = (uint8_t *)discard_const(ue->group_dns[j]);
+            el->values[j].length = strlen(ue->group_dns[j]);
+        }
+
+        ret = sysdb_memberof_bypass_mod(domain, msg);
+        if (ret != EOK) {
+            goto done_txn;
+        }
+
+        modcount++;
+        if (modcount % SYSDB_BATCH_CHUNK == 0 && i + 1 < (int)count) {
+            ret = sysdb_transaction_commit(domain->sysdb);
+            if (ret != EOK) {
+                goto done;
+            }
+            ret = sysdb_transaction_start(domain->sysdb);
+            if (ret != EOK) {
+                goto done;
+            }
+        }
+    }
+    } /* end Phase 2 block */
+
+    /* Phase 3: emit one memberuid modify per group */
+    for (g = 0; g < num_ops; g++) {
+        const struct ldb_message_element *members_el = NULL;
+        struct ldb_val *uid_vals;
+        int uid_count = 0;
+
+        for (i = 0; i < ops[g].attrs->num; i++) {
+            if (strcasecmp(ops[g].attrs->a[i].name, SYSDB_MEMBER) == 0) {
+                members_el = &ops[g].attrs->a[i];
+                break;
+            }
+        }
+        if (members_el == NULL || members_el->num_values == 0) {
+            continue;
+        }
+
+        uid_vals = talloc_array(tmp_ctx, struct ldb_val,
+                                members_el->num_values);
+        if (uid_vals == NULL) {
+            ret = ENOMEM;
+            goto done_txn;
+        }
+
+        for (i = 0; i < (int)members_el->num_values; i++) {
+            struct mbof_user_entry *ue;
+
+            hkey.type = HASH_KEY_STRING;
+            hkey.str = (char *)members_el->values[i].data;
+            hret = hash_lookup(user_map, &hkey, &hval);
+            if (hret != HASH_SUCCESS) continue;
+
+            ue = (struct mbof_user_entry *)hval.ptr;
+            if (ue->username == NULL) continue;
+
+            uid_vals[uid_count].data =
+                (uint8_t *)discard_const(ue->username);
+            uid_vals[uid_count].length = strlen(ue->username);
+            uid_count++;
+        }
+
+        if (uid_count == 0) {
+            talloc_free(uid_vals);
+            continue;
+        }
+
+        msg = ldb_msg_new(tmp_ctx);
+        if (msg == NULL) {
+            ret = ENOMEM;
+            goto done_txn;
+        }
+        msg->dn = group_dns[g];
+
+        ret = ldb_msg_add_empty(msg, SYSDB_MEMBERUID,
+                                LDB_FLAG_MOD_ADD, &el);
+        if (ret != LDB_SUCCESS) {
+            ret = sysdb_error_to_errno(ret);
+            goto done_txn;
+        }
+        el->values = uid_vals;
+        el->num_values = uid_count;
+
+        ret = sysdb_memberof_bypass_mod(domain, msg);
+        if (ret != EOK) {
+            goto done_txn;
+        }
+    }
+
+    ret = sysdb_transaction_commit(domain->sysdb);
+    if (ret != EOK) {
+        goto done_txn;
+    }
+
+    hash_destroy(user_map);
+    talloc_free(tmp_ctx);
+    return EOK;
+
+done_txn:
+    sysdb_transaction_cancel(domain->sysdb);
+done:
+    if (user_map) hash_destroy(user_map);
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
 /* =Add-Basic-Netgroup-NO-CHECKS============================================= */
 
 int sysdb_add_basic_netgroup(struct sss_domain_info *domain,
